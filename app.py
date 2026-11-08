@@ -26,7 +26,7 @@ import io
 import json
 import os
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -38,8 +38,9 @@ import streamlit as st
 # 1. RULE SETTINGS — every threshold lives here. Change a number, the app follows.
 # ════════════════════════════════════════════════════════════════════════════
 CFG = {
-    "ema_fast": 10,            # fast EMA for S-UT / S-DT
+    "ema_fast": 10,            # fast EMA for S-UT / S-DT (also needs fast EMA above / below slow EMA)
     "ema_slow": 50,            # slow EMA: above = uptrend
+    "sdt_needs_3m_low": True,  # S-DT also requires the DT condition (3-month low). False = EMA test alone
     "lookback": 63,            # sessions in "3-month low" (≈ 3 months of trading)
     "latch": 10,               # 'recent' DT test: fresh 3M low within this many sessions
     "tol_pct": 2.0,            # 'tolerance' DT test: close within this % of the 3M low
@@ -78,6 +79,19 @@ NI_BASE = "https://www.niftyindices.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 OFFLINE_DIR = os.environ.get("BREADTH_OFFLINE_DIR")  # for testing without internet
+IST = timezone(timedelta(hours=5, minutes=30))
+SESSION_CUTOFF_IST = (17, 0)  # after 5:00 pm IST the day's session counts as complete
+
+
+def last_complete_session_date(now: datetime | None = None) -> date:
+    """Latest calendar date whose closing prices are final (holidays/weekends simply return no rows).
+
+    Before the cut-off, today's prices are still live/intraday, so we stop at yesterday.
+    This also changes the cache key at the cut-off, forcing a fresh download after the close.
+    """
+    now = (now or datetime.now(IST)).astimezone(IST)
+    today = now.date()
+    return today if (now.hour, now.minute) >= SESSION_CUTOFF_IST else today - timedelta(days=1)
 
 # ════════════════════════════════════════════════════════════════════════════
 # 2. DATA FETCHING
@@ -225,12 +239,20 @@ def index_states(px: pd.DataFrame, dt_mode: str, cfg: dict) -> pd.DataFrame:
             at_low = c <= low * (1 + cfg["tol_pct"] / 100)
         else:  # 'latch' (recommended)
             at_low = new_low.astype(int).rolling(cfg["latch"], min_periods=1).max().astype(bool)
-        state = np.where(c > e_s, np.where(c > e_f, "S-UT", "UT"),
-                         np.where(at_low, np.where(c < e_f, "S-DT", "DT"), "TZ"))
+        # S-UT needs all three: close > fast EMA, close > slow EMA, fast EMA > slow EMA.
+        # Any other close above the slow EMA is UT (pullback below the fast EMA, or the
+        # fast EMA has not yet crossed above the slow EMA).
+        strong_up = (c > e_f) & (c > e_s) & (e_f > e_s)
+        # S-DT mirrors it: close < fast EMA, close < slow EMA, fast EMA < slow EMA (on top of being DT).
+        strong_dn = (c < e_f) & (c < e_s) & (e_f < e_s)
+        dt_zone = at_low | (strong_dn & (not cfg["sdt_needs_3m_low"]))
+        state = np.where(c > e_s, np.where(strong_up, "S-UT", "UT"),
+                         np.where(dt_zone, np.where(strong_dn, "S-DT", "DT"), "TZ"))
         out[k] = c
         out[f"{k}_ema_f"], out[f"{k}_ema_s"], out[f"{k}_low"] = e_f, e_s, low
         out[f"{k}_vs_f"] = (c / e_f - 1) * 100
         out[f"{k}_vs_s"] = (c / e_s - 1) * 100
+        out[f"{k}_fs"] = (e_f / e_s - 1) * 100          # fast EMA vs slow EMA
         out[f"{k}_off_low"] = (c / low - 1) * 100
         out[f"{k}_new_low"] = new_low
         out[f"{k}_state"] = state
@@ -295,8 +317,9 @@ def build_table(px: pd.DataFrame, breadth: pd.DataFrame | None, dt_mode: str, cf
         df["breadth_pct"], df["breadth_n"] = np.nan, np.nan
     F, S = cfg["ema_fast"], cfg["ema_slow"]
     meaning = {
-        "Broad strong uptrend": f"All three above {F} & {S} EMA: broad, healthy participation",
-        "Broad uptrend": f"All three above {S} EMA; some pulling back below {F} EMA (normal dip within uptrend)",
+        "Broad strong uptrend": f"All three above {F} & {S} EMA with {F} EMA above {S} EMA: broad, healthy participation",
+        "Broad uptrend": (f"All three above {S} EMA; at least one either pulling back below its {F} EMA "
+                          f"or with its {F} EMA not yet above its {S} EMA (uptrend not fully confirmed)"),
         "Broader market leading": "Mid & small-caps in uptrend while Nifty 50 lags: heavyweights dragging, broad market healthy",
         "Breadth narrowing": f"Nifty 50 up but one of mid/small has slipped below {S} EMA: participation shrinking",
         "Narrow: large-caps only": f"Only Nifty 50 above {S} EMA: index masks weak breadth (classic late-stage warning)",
@@ -304,7 +327,8 @@ def build_table(px: pd.DataFrame, breadth: pd.DataFrame | None, dt_mode: str, cf
         "Divergent": "At least one index in uptrend and another in downtrend: split market, high whipsaw risk",
         "Correction / no trend": f"All below {S} EMA but none at 3M lows: correction or base-building",
         "Broad downtrend": f"All three below {S} EMA near 3M lows: broad selling",
-        "Broad strong downtrend": f"All three in downtrend and below {F} EMA: maximum weakness, no bounce yet",
+        "Broad strong downtrend": (f"All three in downtrend, below {F} & {S} EMA with {F} EMA below {S} EMA: "
+                                   "maximum weakness, no bounce yet"),
     }
     recs, prev, streak, idx_days = [], None, 0, {k: 0 for k in INDICES}
     scores, bvals = [], []
@@ -378,7 +402,7 @@ def build_table(px: pd.DataFrame, breadth: pd.DataFrame | None, dt_mode: str, cf
         for k in INDICES:
             rec.update({k: r[k], f"{k}_state": st_[k], f"{k}_days": idx_days[k], f"{k}_ema_f": r[f"{k}_ema_f"],
                         f"{k}_ema_s": r[f"{k}_ema_s"], f"{k}_vs_f": r[f"{k}_vs_f"], f"{k}_vs_s": r[f"{k}_vs_s"],
-                        f"{k}_off_low": r[f"{k}_off_low"]})
+                        f"{k}_fs": r[f"{k}_fs"], f"{k}_off_low": r[f"{k}_off_low"]})
         recs.append(rec)
         prev = rec
     return pd.DataFrame(recs).set_index("date")
@@ -415,16 +439,17 @@ with st.sidebar:
     if st.button("Refresh data now", width="stretch"):
         st.cache_data.clear()
         st.rerun()
-    st.caption("Index data cached 1 h, stocks 6 h, constituent list 24 h.")
+    st.caption("A trading day's closes are picked up after 5:00 pm IST. Index data re-checked hourly, "
+               "stocks every 6 h (and again after each close), constituent list daily.")
 
-today = date.today()
-idx_start = today - timedelta(days=window_days + 420)   # EMA warm-up + 3M low + window
-stk_start = today - timedelta(days=window_days + 120)   # 50 DMA needs ~75 calendar days
+data_end = last_complete_session_date()                  # IST-based, never includes a live intraday bar
+idx_start = data_end - timedelta(days=window_days + 420)  # EMA warm-up + 3M low + window
+stk_start = data_end - timedelta(days=window_days + 120)  # 50 DMA needs ~75 calendar days
 
 st.title("Indian market breadth tracker")
 
 try:
-    px, src = load_indices(idx_start, today)
+    px, src = load_indices(idx_start, data_end)
 except Exception as e:  # noqa: BLE001
     st.error(f"Could not load index data: {e}")
     st.stop()
@@ -434,7 +459,8 @@ if use_breadth:
     try:
         members = load_nifty500_symbols()
         syms = tuple(sorted(members["Symbol"].astype(str).str.strip().unique()))
-        closes = load_stock_closes(syms, stk_start, today)
+        closes = load_stock_closes(syms, stk_start, data_end)
+        closes = closes[closes.index <= pd.Timestamp(data_end)]
         got = closes.notna().any().sum()
         breadth = pct_above_dma(closes, CFG["dma"])
         breadth_note = f"{got} of {len(syms)} Nifty 500 stocks downloaded."
@@ -472,6 +498,7 @@ for col, k in zip(cols[:3], INDICES):
         st.markdown(
             f"<div class='small'>vs {CFG['ema_fast']} EMA: <b>{last[f'{k}_vs_f']:+.2f}%</b><br>"
             f"vs {CFG['ema_slow']} EMA: <b>{last[f'{k}_vs_s']:+.2f}%</b><br>"
+            f"{CFG['ema_fast']} EMA vs {CFG['ema_slow']} EMA: <b>{last[f'{k}_fs']:+.2f}%</b><br>"
             f"Above 3M closing low: <b>{last[f'{k}_off_low']:+.2f}%</b><br>"
             f"Sessions in this state: <b>{int(last[f'{k}_days'])}</b></div>", unsafe_allow_html=True)
 with cols[3], st.container(border=True):
@@ -602,10 +629,13 @@ with st.expander("Rules used", expanded=False):
     F, S, L = CFG["ema_fast"], CFG["ema_slow"], CFG["lookback"]
     st.markdown(f"""
 **1. Trend state of each index (daily closes)**
-- **S-UT**: close above both the {F} EMA and the {S} EMA.
+- **S-UT**: close above both the {F} EMA and the {S} EMA, *and* the {F} EMA above the {S} EMA.
 - **UT**: close above the {S} EMA but at or below the {F} EMA (pullback inside an uptrend).
-- **DT**: close at or below the {S} EMA *and* at a 3-month low; **S-DT** if also below the {F} EMA.
-- **TZ**: everything else (below the {S} EMA, not at a 3-month low).
+  Also UT: close above both EMAs while the {F} EMA is still at or below the {S} EMA (early, unconfirmed uptrend).
+- **DT**: close at or below the {S} EMA *and* at a 3-month low.
+- **S-DT**: {"DT, and also " if CFG["sdt_needs_3m_low"] else ""}close below both the {F} EMA and the {S} EMA, *and* the {F} EMA below the {S} EMA.
+  Otherwise a DT day stays DT (e.g. below both EMAs but the {F} EMA still above the {S} EMA: a fresh breakdown).
+- **TZ**: everything else (below the {S} EMA, not DT).
 - 3-month low = lowest close of the last {L} sessions. Recommended test: a fresh low within the last {CFG['latch']} sessions;
   literal: today's close is the low; tolerance: within {CFG['tol_pct']:g}% of it.
 
@@ -637,4 +667,4 @@ with st.expander("Rules used", expanded=False):
 
 st.caption("Data — " + " · ".join(f"{INDICES[k][1]}: {v}" for k, v in src.items())
            + (f" · Breadth: Yahoo Finance adjusted closes; constituents from niftyindices.com. {breadth_note}" if use_breadth else "")
-           + f" · Rendered {datetime.now():%d %b %Y %H:%M}")
+           + f" · Rendered {datetime.now(IST):%d %b %Y %H:%M} IST")
