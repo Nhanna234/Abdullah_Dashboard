@@ -45,6 +45,16 @@ import lender_filter
 import rs_leaders
 import sectors
 
+# Streamlit Cloud reruns app.py after each GitHub update but keeps helper files it already loaded in
+# memory. Reload a helper whenever its file has changed, so app.py never runs against an old copy.
+import importlib  # noqa: E402
+
+for _mod in (lender_filter, rs_leaders, sectors):
+    _mtime = Path(_mod.__file__).stat().st_mtime
+    if getattr(_mod, "_file_mtime", None) != _mtime:
+        importlib.reload(_mod)
+        _mod._file_mtime = _mtime
+
 # ════════════════════════════════════════════════════════════════════════════
 # 1. RULE SETTINGS — every threshold lives here. Change a number, the app follows.
 # ════════════════════════════════════════════════════════════════════════════
