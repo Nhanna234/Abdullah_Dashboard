@@ -553,14 +553,17 @@ def _catalog() -> tuple[list, dict]:
     return sectors.CATALOG + [tuple(x) for x in discovery["new"]], discovery
 
 
-def sector_payload(groups: list, weeks: int, basis: str, days_3m: int) -> dict:
+def sector_payload(groups: list, weeks: int, basis: str, days_3m: int, scope: str = "major") -> dict:
     catalog, discovery = _catalog()
+    if scope == "major":                       # the default: major indices only (sectors.MAJOR)
+        catalog = [c for c in catalog if c[0] in sectors.MAJOR]
     names = [n for n, g, _ in catalog if g in groups]
     data_end = last_complete_session_date()
     data, status = cached_index_prices(tuple(n for n, _, _ in catalog),
                                        data_end - timedelta(days=sectors.SECTOR_CFG["history_days"]), data_end)
+    # an index that does not load is left out everywhere; it shows only in the data status list
     coverage = {
-        "checked": "22 Nov 2026", "discoveryNote": discovery["note"],
+        "checked": "22 Nov 2026", "discoveryNote": discovery["note"], "scope": scope,
         "newFound": [{"name": n, "group": g} for n, g, _ in discovery["new"]],
         "excluded": [{"name": n, "why": w} for n, w in discovery["excluded"]]
                     or [{"name": p, "why": w} for p, w in sectors.EXCLUDE_RULES],
@@ -590,9 +593,9 @@ def sector_payload(groups: list, weeks: int, basis: str, days_3m: int) -> dict:
                     | {"trail": [_j(v) for v in hist.loc[name].tolist()]})
     return {"ok": True, "asOf": _j(latest), "rows": rows, "weeks": [_j(d) for d in hist.columns],
             "notes": sectors.rotation_notes(hist), "coverage": coverage,
-            "failed": [n for n in names if n not in data],
+            "failed": [n for n in names if n not in data], "scope": scope,
             "lenderIndices": sorted(sectors.LENDER_INDICES),
-            "settings": {"groups": groups, "weeks": weeks, "basis": basis, "days3m": days_3m},
+            "settings": {"scope": scope, "groups": groups, "weeks": weeks, "basis": basis, "days3m": days_3m},
             "cfg": {k: v for k, v in sectors.SECTOR_CFG.items() if k != "days"} | {"days": sectors.SECTOR_CFG["days"]},
             "rendered": datetime.now(IST).strftime("%d %b %Y, %H:%M IST")}
 
@@ -665,7 +668,7 @@ dashboard = components.declare_component("abdullah_dashboard", path=str(FRONTEND
 
 DEFAULTS = {
     "breadth": {"window": 90, "dtMode": "latch", "useBreadth": True},
-    "sectors": {"groups": ["Sector", "Theme", "Benchmark"], "weeks": 12, "basis": "composite",
+    "sectors": {"scope": "major", "groups": ["Sector", "Theme", "Benchmark"], "weeks": 12, "basis": "composite",
                 "days3m": sectors.SECTOR_CFG["days_3m_true"]},
     "drill": {"topK": 3, "noLenders": True, **{k: v for k, v in rs_leaders.RS_DEFAULTS.items() if k != "lookback"}},
     "dtModes": DT_MODES,
@@ -697,12 +700,13 @@ def _handle(request: dict, page_objects: dict) -> None:
             groups = [g for g in request.get("groups", []) if g in ("Sector", "Theme", "Benchmark")] or ["Sector"]
             weeks = max(4, min(int(request.get("weeks", 12)), sectors.SECTOR_CFG["max_weeks"]))
             basis = request.get("basis") if request.get("basis") in ("composite", "r_3m", "away_low") else "composite"
-            out = sector_payload(groups, weeks, basis, int(request.get("days3m", 90)))
+            out = sector_payload(groups, weeks, basis, int(request.get("days3m", 90)),
+                                 "all" if request.get("scope") == "all" else "major")
         elif kind == "drill":
             p = {"threshold": float(request.get("threshold", 100)), "history": int(request.get("history", 6)),
                  "use_ema": bool(request.get("use_ema", True)), "cr": float(request.get("cr", 75)),
                  "mr": float(request.get("mr", 5))}
-            out = drill_payload(list(request.get("indices", []))[:10], p, bool(request.get("noLenders", True)))
+            out = drill_payload(list(request.get("indices", []))[:80], p, bool(request.get("noLenders", True)))
         else:
             out = {"ok": False, "error": f"Unknown request '{kind}'."}
     except Exception as e:  # noqa: BLE001

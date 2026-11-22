@@ -11,7 +11,7 @@ const bold = (s) => s.split(/\*\*(.+?)\*\*/g).map((part, i) => (i % 2 ? <b key={
 
 export default function Sectors({ args, ask, pending }) {
   const d = args.sectors;
-  const dflt = args.defaults?.sectors || { groups: ["Sector", "Theme", "Benchmark"], weeks: 12, basis: "composite", days3m: 90 };
+  const dflt = args.defaults?.sectors || { scope: "major", groups: ["Sector", "Theme", "Benchmark"], weeks: 12, basis: "composite", days3m: 90 };
   const [s, setS] = useState(d?.settings || dflt);
   const busy = Boolean(pending.sectors);
   const bases = args.defaults?.bases || { composite: "Rank(1,3,6), as in your sheet", r_3m: "3M return", away_low: "Away from 52W low" };
@@ -33,6 +33,10 @@ export default function Sectors({ args, ask, pending }) {
   return (
     <>
       <div className="controls">
+        <Field label="Indices">
+          <Seg label="Which indices" value={s.scope || "major"} onChange={(v) => change({ scope: v })}
+            options={[["major", "Major"], ["all", "All NSE"]]} />
+        </Field>
         <Field label="Include">
           <div className="chips" role="group" aria-label="Index groups">
             {GROUPS.map(([g, label]) => (
@@ -75,14 +79,16 @@ function SectorBody({ d, args, ask, pending }) {
   const drillable = rows.filter((r) => r.drillable && r.group !== "Benchmark");
   const defaultPicks = (noLenders) => drillable.filter((r) => !(noLenders && lenderSet.has(r.name))).slice(0, ddef.topK).map((r) => r.name);
   const [rsSet, setRsSet] = useState(args.drill?.settings ? { ...ddef, ...args.drill.settings } : ddef);
-  const [picks, setPicks] = useState(args.drill?.indices || defaultPicks(ddef.noLenders));
+  const loaded = new Set(rows.map((r) => r.name));
+  const [picks, setPicks] = useState((args.drill?.indices || []).filter((x) => loaded.has(x)).length
+    ? args.drill.indices.filter((x) => loaded.has(x)) : defaultPicks(ddef.noLenders));
 
   // first visit: screen the default indices once the ranking is in
   useEffect(() => {
     if (!args.drill && !pending.drill && picks.length) ask("drill", { indices: picks, ...rsSet });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const togglePick = (name) => setPicks((p) => (p.includes(name) ? p.filter((x) => x !== name) : p.length >= 10 ? p : [...p, name]));
+  const togglePick = (name) => setPicks((p) => (p.includes(name) ? p.filter((x) => x !== name) : [...p, name]));
   const runDrill = () => picks.length && ask("drill", { indices: picks, ...rsSet });
 
   return (
@@ -112,9 +118,6 @@ function SectorBody({ d, args, ask, pending }) {
         <div>
           <h2 className="section-title" style={{ marginBottom: 10 }}>This week's rotation</h2>
           <ul className="notes">{d.notes.map((t, i) => <li key={i}>{bold(t)}</li>)}</ul>
-          {d.failed?.length > 0 && (
-            <p className="notice" style={{ marginTop: 14 }}>{d.failed.length} {d.failed.length === 1 ? "index" : "indices"} did not load this time and {d.failed.length === 1 ? "is" : "are"} left out: {d.failed.join(", ")}. The data status list at the bottom says why.</p>
-          )}
         </div>
       </section>
 
@@ -122,7 +125,8 @@ function SectorBody({ d, args, ask, pending }) {
 
       <Drill args={args} ask={ask} pending={pending} picks={picks} togglePick={togglePick} setPicks={setPicks}
         rsSet={rsSet} setRsSet={setRsSet} runDrill={runDrill} drillable={drillable} lenderSet={lenderSet}
-        resetPicks={() => setPicks(defaultPicks(rsSet.noLenders))} />
+        resetPicks={() => setPicks(defaultPicks(rsSet.noLenders))}
+        selectAll={() => setPicks(drillable.map((r) => r.name))} clearPicks={() => setPicks([])} />
 
       <History d={d} />
     </>
@@ -203,10 +207,16 @@ function Leaderboard({ d, picks, togglePick }) {
   );
 }
 
-function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSet, runDrill, drillable, lenderSet, resetPicks }) {
+function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSet, runDrill, drillable, lenderSet, resetPicks, selectAll, clearPicks }) {
   const r = args.drill;
   const busy = Boolean(pending.drill);
   const [adding, setAdding] = useState("");
+  const [showAll, setShowAll] = useState(false);
+  const [currentOnly, setCurrentOnly] = useState(false);
+  const lastLabel = r?.labels?.[r.labels.length - 1] || "the latest month";
+  const stocks = r?.stocks ? (currentOnly ? r.stocks.filter((x) => x.cells[x.cells.length - 1]?.[1]) : r.stocks) : [];
+  const chipsShown = showAll || picks.length <= 6 ? picks : picks.slice(0, 6);
+  const nameList = (list) => (list.length > 4 ? `${list.length} indices` : list.join(", "));
   const set = (patch) => setRsSet((x) => ({ ...x, ...patch }));
   const changed = !r || JSON.stringify([...(r.indices || [])].sort()) !== JSON.stringify([...picks].sort()) ||
     ["threshold", "history", "use_ema", "cr", "mr", "noLenders"].some((k) => r.settings?.[k] !== rsSet[k]);
@@ -214,7 +224,7 @@ function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSe
   const save = () =>
     downloadCSV(`strong_stocks_${r.lastMonth || ""}.csv`,
       ["Symbol", "Company", "Industry", "In strong indices", ...r.labels, "Run", "Close in range", "Month return", "vs 12M EMA", "Price"],
-      r.stocks.map((s) => [s.symbol, s.company, s.industry, s.indices.join("; "), ...s.cells.map((c) => c[0]), s.run, s.cr, s.mr, s.emaGap, s.price]));
+      stocks.map((s) => [s.symbol, s.company, s.industry, s.indices.join("; "), ...s.cells.map((c) => c[0]), s.run, s.cr, s.mr, s.emaGap, s.price]));
   return (
     <section className="section" aria-label="Strong stocks">
       <div className="section-head">
@@ -224,11 +234,16 @@ function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSe
       <div className="panel">
         <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
           <div className="chips">
-            {picks.map((p) => (
+            {chipsShown.map((p) => (
               <span key={p} className="chip">{p}{lenderSet.has(p) && rsSet.noLenders ? " (lenders only)" : ""}
                 <button type="button" aria-label={`Remove ${p}`} onClick={() => togglePick(p)}>×</button>
               </span>
             ))}
+            {picks.length > 6 && (
+              <button type="button" className="chip toggleable" onClick={() => setShowAll((x) => !x)}>
+                {showAll ? "Show fewer" : `+${picks.length - 6} more`}
+              </button>
+            )}
             {!picks.length && <span className="muted">No index chosen yet.</span>}
           </div>
           <select className="select" value={adding} aria-label="Add an index"
@@ -236,7 +251,9 @@ function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSe
             <option value="">Add an index</option>
             {drillable.filter((x) => !picks.includes(x.name)).map((x) => <option key={x.name} value={x.name}>{x.pos}. {x.name}</option>)}
           </select>
-          <button type="button" className="linkish" onClick={resetPicks}>Use the top-ranked ones</button>
+          <button type="button" className="linkish" onClick={resetPicks}>Top-ranked</button>
+          <button type="button" className="linkish" onClick={selectAll}>Select all {drillable.length}</button>
+          {picks.length > 0 && <button type="button" className="linkish" onClick={clearPicks}>Clear</button>}
         </div>
         <div className="controls" style={{ margin: "14px 0 0" }}>
           <Field label="RS threshold"><input className="numin" type="number" min={50} max={100} value={rsSet.threshold} onChange={(e) => set({ threshold: Number(e.target.value) })} /></Field>
@@ -260,13 +277,21 @@ function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSe
             <>
               <div className="section-head">
                 <p>
-                  <b>{r.stocks.length}</b> of {r.members} stocks in {r.indices.join(", ")} pass
+                  <b>{r.stocks.length}</b> of {r.members} stocks in {nameList(r.indices)} pass
                   {r.excluded?.length ? ` (${r.excluded.length} lending companies left out)` : ""}.
                   {r.provisional && <span className="muted"> {r.labels[r.labels.length - 1]} is still running, so the last month is provisional.</span>}
                 </p>
                 {r.stocks.length > 0 && <button type="button" className="btn small" onClick={save}>Download CSV</button>}
               </div>
-              {r.stocks.length > 0 ? (
+              {r.stocks.length > 0 && (
+                <div style={{ margin: "-2px 0 10px" }}>
+                  <Toggle checked={currentOnly} onChange={setCurrentOnly}>
+                    Only stocks at or above the RS threshold in {lastLabel}
+                    {currentOnly ? ` (${stocks.length} of ${r.stocks.length})` : ""}
+                  </Toggle>
+                </div>
+              )}
+              {stocks.length > 0 ? (
                 <div className="table-wrap" style={{ maxHeight: 620 }}>
                   <table className="data">
                     <thead>
@@ -277,7 +302,7 @@ function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSe
                       </tr>
                     </thead>
                     <tbody>
-                      {r.stocks.map((s) => (
+                      {stocks.map((s) => (
                         <tr key={s.symbol}>
                           <td className="sticky-col"><b>{s.symbol}</b><div className="faint" style={{ fontSize: 12, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis" }}>{s.company}</div></td>
                           <td>{s.industry}</td>
@@ -298,7 +323,9 @@ function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSe
                   </table>
                 </div>
               ) : (
-                <p className="muted">No stock in these indices meets the RS rules right now. Try more indices, or a lower RS threshold.</p>
+                <p className="muted">{r.stocks.length > 0
+                  ? `None of these stocks is at or above the RS threshold in ${lastLabel}. Switch the filter off to see all ${r.stocks.length}.`
+                  : "No stock in these indices meets the RS rules right now. Try more indices, or a lower RS threshold."}</p>
               )}
               <p className="section-note" style={{ marginTop: 8 }}>
                 Month cells show RS as a percentage of its 12-month high. Dark: a new 12-month high. Light: at or above the threshold ({r.settings.threshold}%). Run: marked months in a row up to the latest. Bold: the stock is in more than one leading index.
@@ -356,9 +383,9 @@ function Coverage({ c }) {
   const ok = c.status.filter((s) => s.source && s.source !== "FAILED" && s.source !== "not requested").length;
   return (
     <details className="more">
-      <summary>Which indices are included, and where the data came from ({ok} of {c.status.length} loaded)</summary>
+      <summary>Which indices are included, and where the data came from ({ok} of {c.status.length} loaded{ok < c.status.length ? "; the rest are left out" : ""})</summary>
       <div className="body" style={{ maxWidth: "none" }}>
-        <p>Every NSE sectoral and thematic index, plus Nifty 50, 200 and 500 as benchmarks. Checked against niftyindices.com on {c.checked}; new NSE indices are added automatically ({c.discoveryNote}).</p>
+        <p>{c.scope === "all" ? "Every NSE sectoral and thematic index" : "The major NSE sector and thematic indices (switch to All NSE above for the full list)"}, plus Nifty 50, 200 and 500 as benchmarks. An index that does not load is left out of the ranking and the screen; it appears only in the table below. Checked against niftyindices.com on {c.checked}; new NSE indices are added automatically ({c.discoveryNote}).</p>
         {c.newFound.length > 0 && <p style={{ marginTop: 6 }}><b>Added since then:</b> {c.newFound.map((x) => `${x.name} (${x.group.toLowerCase()})`).join(", ")}.</p>}
         <h4>Left out on purpose</h4>
         <ul>{c.excluded.map((x) => <li key={x.name}><b>{x.name}</b>: {x.why}</li>)}</ul>

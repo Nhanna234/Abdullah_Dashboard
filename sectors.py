@@ -125,6 +125,17 @@ CATALOG = [
 ]
 GROUP = {n: g for n, g, _ in CATALOG}
 
+# "Major indices" (the default view): NSE's long-established sector indices, the themes your Google Sheet
+# tracked plus a few widely followed ones, and the three benchmarks. The full list stays available as "All NSE".
+MAJOR = [
+    "Nifty Auto", "Nifty Bank", "Nifty Private Bank", "Nifty PSU Bank", "Nifty Financial Services",
+    "Nifty FMCG", "Nifty Consumer Durables", "Nifty Healthcare", "Nifty Pharma", "Nifty IT", "Nifty Media",
+    "Nifty Metal", "Nifty Oil and Gas", "Nifty Realty",
+    "Nifty Energy", "Nifty Infrastructure", "Nifty India Consumption", "Nifty Commodities", "Nifty MNC",
+    "Nifty Services Sector", "Nifty PSE", "Nifty India Defence", "Nifty Capital Markets", "Nifty India Manufacturing",
+    "Nifty 50", "Nifty 200", "Nifty 500",
+]
+
 # NSE indices left out on purpose: (pattern, reason). Checked against every index NSE lists.
 EXCLUDE_RULES = [
     (r"25/50|25% cap|equal weight|50:30:20|90:10", "re-weighted copy of another index (same stocks)"),
