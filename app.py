@@ -8,8 +8,10 @@ What it does
    (S-UT / UT / TZ / DT / S-DT) from 10- and 50-day EMAs and 3-month lows.
 2. True breadth: % of Nifty 500 constituents closing above their own 50-day SMA.
 3. A combined regime, posture, breadth check and a written remark for every session.
-4. Sector rotation page: 17 Nifty sector / thematic / benchmark indices ranked by Rank(1,3,6)
-   (0.5 x rank of 1M + 0.3 x rank of 3M + 0.2 x rank of 6M return), with weekly rank history.
+4. Sector rotation page: every NSE sectoral and thematic index (plus Nifty 50/200/500) ranked by
+   Rank(1,3,6) = 0.5 x rank of 1M + 0.3 x rank of 3M + 0.2 x rank of 6M return, with weekly rank
+   history, and a drill-down into the strongest indices' stocks using the Abu Abdullah RS rules.
+   The work is done in sectors.py, rs_leaders.py and lender_filter.py.
 
 Data sources (fetched fresh, cached for a few hours)
 ----------------------------------------------------
@@ -28,6 +30,7 @@ import io
 import json
 import os
 import re
+import tempfile
 import textwrap
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -37,6 +40,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+
+import lender_filter
+import rs_leaders
+import sectors
 
 # ════════════════════════════════════════════════════════════════════════════
 # 1. RULE SETTINGS — every threshold lives here. Change a number, the app follows.
@@ -413,215 +420,14 @@ def build_table(px: pd.DataFrame, breadth: pd.DataFrame | None, dt_mode: str, cf
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 3b. SECTOR ROTATION — mirrors the 'Sectors' and 'Analysis' tabs of the Google Sheet
+# 3b. SECTOR ROTATION — engine in sectors.py (index list, prices, Rank(1,3,6)) and rs_leaders.py
+#     (Abu Abdullah RS screen for the strongest indices' stocks); this file only draws the page.
 # ════════════════════════════════════════════════════════════════════════════
-SECTORS = {  # sheet name: (niftyindices name, NSE long name, Yahoo fallback, group)
-    "NIFTY_BANK": ("NIFTY BANK", "Nifty Bank", "^NSEBANK", "Sector"),
-    "NIFTY_AUTO": ("NIFTY AUTO", "Nifty Auto", "^CNXAUTO", "Sector"),
-    "NIFTY_MNC": ("NIFTY MNC", "Nifty MNC", "^CNXMNC", "Theme"),
-    "NIFTY_SERV_SECTOR": ("NIFTY SERV SECTOR", "Nifty Services Sector", "^CNXSERVICE", "Theme"),
-    "NIFTY_FMCG": ("NIFTY FMCG", "Nifty FMCG", "^CNXFMCG", "Sector"),
-    "NIFTY_IT": ("NIFTY IT", "Nifty IT", "^CNXIT", "Sector"),
-    "NIFTY_MEDIA": ("NIFTY MEDIA", "Nifty Media", "^CNXMEDIA", "Sector"),
-    "NIFTY_METAL": ("NIFTY METAL", "Nifty Metal", "^CNXMETAL", "Sector"),
-    "NIFTY_PHARMA": ("NIFTY PHARMA", "Nifty Pharma", "^CNXPHARMA", "Sector"),
-    "NIFTY_ENERGY": ("NIFTY ENERGY", "Nifty Energy", "^CNXENERGY", "Sector"),
-    "NIFTY_INFRA": ("NIFTY INFRA", "Nifty Infrastructure", "^CNXINFRA", "Theme"),
-    "NIFTY_REALTY": ("NIFTY REALTY", "Nifty Realty", "^CNXREALTY", "Sector"),
-    "NIFTY_CONSUMPTION": ("NIFTY CONSUMPTION", "Nifty India Consumption", "^CNXCONSUM", "Theme"),
-    "NIFTY_COMMODITIES": ("NIFTY COMMODITIES", "Nifty Commodities", "^CNXCMDT", "Theme"),
-    "NIFTY_50": ("NIFTY 50", "Nifty 50", "^NSEI", "Benchmark"),
-    "NIFTY_500": ("NIFTY 500", "Nifty 500", "^CRSLDX", "Benchmark"),
-    "NIFTY_200": ("NIFTY 200", "Nifty 200", "^CNX200", "Benchmark"),
-}
-SECTOR_CFG = {
-    "w_1m": 0.5, "w_3m": 0.3, "w_6m": 0.2,   # Rank(1,3,6) weights, same as the sheet
-    "days": {"1w": 7, "1m": 30, "6m": 180, "1y": 365},  # calendar-day lookbacks, same as the sheet
-    "days_3m_true": 90,         # a real 3 months
-    "days_3m_sheet": 60,        # what the sheet's '3M Return' formula actually uses (TODAY()-60)
-    "top_n": 5,                 # 'leaders' = top 5 positions
-    "move_weeks": 4,            # rank change measured over this many weeks
-    "history_days": 740,        # data fetched: 52 weeks of history + 1 year lookback
-}
 SECTOR_COLORS = ["#fde68a", "#bfdbfe", "#fecaca", "#bbf7d0", "#ddd6fe", "#fed7aa", "#a5f3fc", "#fbcfe8",
                  "#d9f99d", "#e9d5ff", "#99f6e4", "#fecdd3", "#c7d2fe", "#fef08a", "#e5e7eb", "#d6d3d1", "#cbd5e1"]
-SECTOR_COLOR = dict(zip(SECTORS, SECTOR_COLORS))
 BASIS = {"Composite Rank(1,3,6) — as in your sheet": "composite",
          "3M return": "r_3m",
          "Away from 52W low": "away_low"}
-
-
-def _ni_ohlc(s: requests.Session, api_name: str, long_name: str, start: date, end: date) -> pd.DataFrame:
-    rows, cur = [], start
-    while cur <= end:
-        nxt = min(cur + timedelta(days=360), end)
-        last_err = None
-        for idx_name in (long_name, api_name):     # the site has used both forms of indexName
-            try:
-                rows += _ni_index_chunk(s, api_name, idx_name, cur, nxt)
-                last_err = None
-                break
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-        if last_err is not None:
-            raise last_err
-        cur = nxt + timedelta(days=1)
-        time.sleep(0.3)
-    if not rows:
-        raise ValueError("no rows returned")
-    df = pd.DataFrame(rows)
-    idx = pd.to_datetime(df["HistoricalDate"], format="%d %b %Y")
-    out = pd.DataFrame({c.lower(): pd.to_numeric(df[c], errors="coerce").to_numpy() for c in ("CLOSE", "HIGH", "LOW")},
-                       index=idx).sort_index()
-    return out[~out.index.duplicated(keep="last")].dropna(subset=["close"])
-
-
-def _yahoo_ohlc(ticker: str, start: date, end: date) -> pd.DataFrame:
-    import yfinance as yf
-    df = yf.download(ticker, start=start, end=end + timedelta(days=1), progress=False, auto_adjust=False)
-    if df is None or df.empty:
-        raise ValueError(f"Yahoo returned nothing for {ticker}")
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    out = df[["Close", "High", "Low"]].rename(columns=str.lower)
-    out.index = pd.to_datetime(out.index).tz_localize(None).normalize()
-    return out.dropna(subset=["close"])
-
-
-def _fetch_one_sector(name: str, start: date, end: date) -> tuple[str, pd.DataFrame | None, str]:
-    api, long_name, yh, _ = SECTORS[name]
-    try:
-        return name, _ni_ohlc(_ni_session(), api, long_name, start, end), "niftyindices.com"
-    except Exception as e1:  # noqa: BLE001
-        try:
-            return name, _yahoo_ohlc(yh, start, end), f"Yahoo {yh} (niftyindices failed: {e1})"
-        except Exception as e2:  # noqa: BLE001
-            return name, None, f"FAILED — niftyindices: {e1}; Yahoo: {e2}"
-
-
-@st.cache_data(ttl=60 * 60, show_spinner="Fetching 17 sector indices (first load ~20–40 s)…")
-def load_sectors(start: date, end: date) -> tuple[dict, dict]:
-    if OFFLINE_DIR:
-        raw = pd.read_csv(os.path.join(OFFLINE_DIR, "sectors.csv"), parse_dates=["date"])
-        data = {n: g.set_index("date")[["close", "high", "low"]].sort_index() for n, g in raw.groupby("name")}
-        return data, {n: "offline file" for n in data}
-    from concurrent.futures import ThreadPoolExecutor
-    data, src = {}, {}
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        for name, df, note in ex.map(lambda n: _fetch_one_sector(n, start, end), list(SECTORS)):
-            src[name] = note
-            if df is not None and len(df):
-                data[name] = df[df.index <= pd.Timestamp(end)]
-    return data, src
-
-
-def _base_close(df: pd.DataFrame, asof: pd.Timestamp, days: int) -> float:
-    """Sheet logic: first close ON or AFTER (as-of date − N calendar days)."""
-    target = asof - pd.Timedelta(days=days)
-    if df.index[0] > target + pd.Timedelta(days=5):      # not enough history
-        return np.nan
-    sub = df.loc[target:asof, "close"]
-    return float(sub.iloc[0]) if len(sub) else np.nan
-
-
-def sector_snapshot(data: dict, asof: pd.Timestamp, days_3m: int, cfg: dict = SECTOR_CFG) -> pd.DataFrame:
-    rows = []
-    for name in SECTORS:
-        df = data.get(name)
-        if df is None:
-            continue
-        df = df.loc[:asof]
-        if df.empty or (asof - df.index[-1]).days > 7:      # no recent close → skip
-            continue
-        c = float(df["close"].iloc[-1])
-        b = {k: _base_close(df, asof, d) for k, d in cfg["days"].items()}
-        b["3m"] = _base_close(df, asof, days_3m)
-        yr = df.loc[asof - pd.Timedelta(days=cfg["days"]["1y"]):]
-        enough_yr = df.index[0] <= asof - pd.Timedelta(days=cfg["days"]["1y"] - 5)
-        hi = pd.concat([yr["high"].where(yr["high"] > 0), yr["close"]]).max() if enough_yr else np.nan
-        lo = pd.concat([yr["low"].where(yr["low"] > 0), yr["close"]]).min() if enough_yr else np.nan
-        rows.append({
-            "name": name, "group": SECTORS[name][3], "date": df.index[-1], "close": c,
-            "high_52w": hi, "low_52w": lo,
-            "r_1w": c / b["1w"] - 1, "r_1m": c / b["1m"] - 1, "r_3m": c / b["3m"] - 1,
-            "r_6m_ex_1m": b["1m"] / b["6m"] - 1,           # price 1M ago vs 6M ago (compounded)
-            "r_6m": c / b["6m"] - 1, "r_1y": c / b["1y"] - 1,
-            "away_low": c / lo - 1, "off_high": c / hi - 1,
-        })
-    t = pd.DataFrame(rows).set_index("name")
-    if t.empty:
-        return t
-    # Google Sheets RANK(): 1 = highest value, ties share the lower rank number
-    t["rk_1m"] = t["r_1m"].rank(ascending=False, method="min")
-    t["rk_3m"] = t["r_3m"].rank(ascending=False, method="min")
-    t["rk_6m"] = t["r_6m"].rank(ascending=False, method="min")
-    t["score"] = cfg["w_1m"] * t["rk_1m"] + cfg["w_3m"] * t["rk_3m"] + cfg["w_6m"] * t["rk_6m"]
-    return t
-
-
-def order_by(t: pd.DataFrame, basis: str) -> pd.DataFrame:
-    """Adds 'pos' (1 = best) using the chosen basis. Composite: lowest score first, ties → better 1M."""
-    if basis == "composite":
-        o = t.sort_values(["score", "r_1m"], ascending=[True, False], na_position="last")
-    else:
-        o = t.sort_values([basis, "r_1m"], ascending=[False, False], na_position="last")
-    o = o.copy()
-    o["pos"] = range(1, len(o) + 1)
-    return o
-
-
-def week_end_dates(data: dict, latest: pd.Timestamp, weeks: int) -> list[pd.Timestamp]:
-    """Last trading day of each week (Mon–Fri) for the last `weeks` weeks; the newest is the latest close."""
-    ref = data.get("NIFTY_50")
-    idx = ref.index if ref is not None else pd.DatetimeIndex(sorted(set().union(*[d.index for d in data.values()])))
-    idx = idx[idx <= latest]
-    ends = pd.Series(idx, index=idx).groupby(idx.to_period("W-FRI")).max()
-    return list(ends.iloc[-weeks:])
-
-
-def rank_history(data: dict, dates: list, days_3m: int, basis: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Position and composite score of every index at each weekly snapshot (index × date)."""
-    pos, score = {}, {}
-    for d in dates:
-        o = order_by(sector_snapshot(data, d, days_3m), basis)
-        pos[d], score[d] = o["pos"], o["score"]
-    return pd.DataFrame(pos), pd.DataFrame(score)
-
-
-def rotation_notes(hist: pd.DataFrame, cfg: dict = SECTOR_CFG) -> list[str]:
-    """Plain-language summary of what moved, from the weekly positions table (index × date)."""
-    n, k = cfg["top_n"], cfg["move_weeks"]
-    cur = hist.iloc[:, -1].dropna().sort_values()
-    notes = [f"**Top {n} now:** " + ", ".join(f"{s} ({int(p)})" for s, p in cur.head(n).items()) + "."]
-    if hist.shape[1] >= 2:
-        prev = hist.iloc[:, -2].dropna()
-        now_top, prev_top = set(cur[cur <= n].index), set(prev[prev <= n].index)
-        if now_top - prev_top:
-            notes.append("**New in top {}:** {}.".format(n, ", ".join(sorted(now_top - prev_top))))
-        if prev_top - now_top:
-            notes.append("**Dropped out of top {}:** {}.".format(n, ", ".join(sorted(prev_top - now_top))))
-        if now_top == prev_top:
-            notes.append(f"Top {n} unchanged from last week (order may differ).")
-    if hist.shape[1] > k:
-        chg = (hist.iloc[:, -1 - k] - hist.iloc[:, -1]).dropna()     # + = moved up
-        up, dn = chg.sort_values(ascending=False), chg.sort_values()
-        ups = [f"{s} +{int(v)}" for s, v in up.head(3).items() if v > 0]
-        dns = [f"{s} {int(v)}" for s, v in dn.head(3).items() if v < 0]
-        if ups:
-            notes.append(f"**Biggest climbers over {k} weeks:** " + ", ".join(ups) + ".")
-        if dns:
-            notes.append(f"**Biggest fallers over {k} weeks:** " + ", ".join(dns) + ".")
-    streak = (hist <= n).sum(axis=1)
-    steady = streak[streak >= max(3, int(hist.shape[1] * 0.75))].sort_values(ascending=False)
-    if len(steady):
-        notes.append(f"**Persistent leaders** (in top {n} for most of the window): "
-                     + ", ".join(f"{s} ({int(v)}/{hist.shape[1]} weeks)" for s, v in steady.items()) + ".")
-    if "NIFTY_50" in cur.index:
-        others = cur.drop([b for b in ("NIFTY_50", "NIFTY_200", "NIFTY_500") if b in cur.index])
-        above = int((others < cur["NIFTY_50"]).sum())
-        notes.append(f"**{above} of {len(others)}** sectoral/thematic indices rank above Nifty 50"
-                     + (" — leadership is broad." if above >= len(others) / 2 else " — leadership is narrow."))
-    return notes
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -907,45 +713,140 @@ def _pos_color(p, n=17):
     return f"background-color: rgb({r},{g},{b}); color: {txt}"
 
 
+# ---- cached data for the Sector rotation page (the work itself is in sectors.py and rs_leaders.py)
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def cached_discovery() -> dict:
+    if OFFLINE_DIR:
+        return {"new": [], "excluded": [], "ok": True, "note": "offline test data"}
+    return sectors.discover()
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def cached_mapping() -> dict:
+    return {} if OFFLINE_DIR else sectors.load_mapping()
+
+
+@st.cache_data(ttl=60 * 60, show_spinner="Fetching sector and thematic indices from niftyindices.com "
+                                          "(first load can take about a minute)…")
+def cached_index_prices(names: tuple, start: date, end: date) -> tuple[dict, dict]:
+    if OFFLINE_DIR:
+        raw = pd.read_csv(os.path.join(OFFLINE_DIR, "sectors.csv"), parse_dates=["date"])
+        data = {n: g.set_index("date")[["close", "high", "low"]].sort_index()
+                for n, g in raw.groupby("name") if n in names}
+        return data, {n: {"source": "offline file", "api": "", "rows": len(d), "last": d.index.max()}
+                      for n, d in data.items()}
+    return sectors.fetch_all(list(names), start, end, cached_mapping())
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def cached_constituents(name: str, page: str) -> tuple[pd.DataFrame, str]:
+    if OFFLINE_DIR:
+        return pd.read_csv(os.path.join(OFFLINE_DIR, "constituents", re.sub(r"\W+", "_", name) + ".csv")), "offline"
+    fname = sectors.constituent_file(page)
+    return sectors.download_list(fname), fname
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def cached_nbfc_index() -> set:
+    if OFFLINE_DIR:
+        return set()
+    try:
+        return set(sectors.download_list("ind_niftyNBFC_list.csv")["Symbol"])
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+@st.cache_data(ttl=60 * 60, show_spinner="Downloading monthly prices of the constituents from Yahoo Finance…")
+def cached_monthly(symbols: tuple) -> pd.DataFrame:
+    if OFFLINE_DIR:
+        m = pd.read_pickle(os.path.join(OFFLINE_DIR, "stocks_monthly.pkl"))
+        keep = [s + rs_leaders.SUFFIX for s in symbols if s + rs_leaders.SUFFIX in m["Close"].columns]
+        cols = [c for c in m.columns if c[1] in keep + [rs_leaders.INDEX_TICKER]]
+        return m[cols]
+    return rs_leaders.fetch_monthly(list(symbols))
+
+
+@st.cache_resource(max_entries=1)
+def lender_cache():
+    return lender_filter.BasicIndustryCache(os.path.join(tempfile.gettempdir(), "dash_basic_industry.json"),
+                                            fetch_one=(lambda s: None) if OFFLINE_DIR else None)
+
+
+def _rs_cell_style(marked_high, marked):
+    if marked_high:
+        return "background-color:#0e7490;color:#ffffff;font-weight:600"
+    if marked:
+        return "background-color:#a5f3fc;color:#0f172a"
+    return "color:#9ca3af"
+
+
 def page_sectors() -> None:
+    discovery = cached_discovery()
+    for n, g, _ in discovery["new"]:
+        sectors.GROUP.setdefault(n, g)
+    catalog = sectors.CATALOG + [tuple(x) for x in discovery["new"]]
+    pages = {n: p for n, _, p in catalog}
+
     with st.sidebar:
         st.header("Sector settings")
-        weeks = st.slider("Weeks of rank history", 4, 52, 12)
+        groups = st.multiselect("Include", ["Sector", "Theme", "Benchmark"], default=["Sector", "Theme", "Benchmark"],
+                                help="Sector = NSE sectoral indices, Theme = NSE thematic indices, "
+                                     "Benchmark = Nifty 50 / 200 / 500.")
+        weeks = st.slider("Weeks of rank history", 4, sectors.SECTOR_CFG["max_weeks"], 12)
         basis = BASIS[st.radio("Rank by", list(BASIS), index=0)]
         lb = st.radio("3M return lookback", ["90 days (a true 3 months)", "60 days (what my Google Sheet uses)"],
                       index=0, help="Your sheet's '3M Return' formula uses TODAY()-60, i.e. 2 months.")
-        days_3m = SECTOR_CFG["days_3m_true"] if lb.startswith("90") else SECTOR_CFG["days_3m_sheet"]
+        days_3m = sectors.SECTOR_CFG["days_3m_true"] if lb.startswith("90") else sectors.SECTOR_CFG["days_3m_sheet"]
+        with st.expander("Strong-stock drill-down (Abu Abdullah RS rules)", expanded=False):
+            top_k = st.slider("Strongest indices to drill into", 1, 10, 3)
+            rs_thr = st.number_input("RS threshold %", 50, 100, rs_leaders.RS_DEFAULTS["threshold"], step=1)
+            rs_hist = st.slider("Months shown", 3, 12, rs_leaders.RS_DEFAULTS["history"])
+            rs_ema = st.toggle("Close above 12-month EMA", value=rs_leaders.RS_DEFAULTS["use_ema"])
+            rs_cr = st.number_input("Min closing range %", 0, 100, rs_leaders.RS_DEFAULTS["cr"], step=5)
+            rs_mr = st.number_input("Min monthly return %", -50, 100, rs_leaders.RS_DEFAULTS["mr"], step=1)
+            no_lenders = st.toggle("Exclude lending companies", value=True,
+                                   help="Banks, NBFCs, housing finance and financial institutions are left out "
+                                        "(same rule as the Abu Abdullah app).")
         if st.button("Refresh data now", width="stretch", key="sec_refresh"):
             st.cache_data.clear()
             st.rerun()
         st.caption("Closes are picked up after 5:00 pm IST; index data re-checked hourly.")
 
     st.title("Sector rotation")
-    data_end = last_complete_session_date()
-    data, src = load_sectors(data_end - timedelta(days=SECTOR_CFG["history_days"]), data_end)
-    failed = [n for n in SECTORS if n not in data]
-    if not data:
-        st.error("Could not load any sector index. Details: " + "; ".join(f"{k}: {v}" for k, v in src.items()))
+    if not groups:
+        st.info("Choose at least one group in the sidebar.")
         st.stop()
+    names = tuple(n for n, g, _ in catalog if g in groups)
+    data_end = last_complete_session_date()
+    data, status = cached_index_prices(tuple(n for n, _, _ in catalog),
+                                       data_end - timedelta(days=sectors.SECTOR_CFG["history_days"]), data_end)
+    data = {n: d for n, d in data.items() if n in names}
+    failed = [n for n in names if n not in data]
+    if not data:
+        st.error("Could not load any index from niftyindices.com. Open 'Index list and data status' below for details.")
     if failed:
-        st.warning("Not loaded this time (left out of the ranking): " + ", ".join(failed))
+        st.warning(f"{len(failed)} of {len(names)} indices did not load this time and are left out of the ranking: "
+                   + ", ".join(failed))
+    if not data:
+        _coverage_panel(catalog, discovery, status, names)
+        st.stop()
 
     latest = max(df.index.max() for df in data.values())
-    snap = order_by(sector_snapshot(data, latest, days_3m), basis)
-    dates = week_end_dates(data, latest, weeks)
-    hist, _ = rank_history(data, dates, days_3m, basis)
-    hist = hist.reindex(snap.index)
+    snap = sectors.order_by(sectors.sector_snapshot(data, latest, days_3m), basis)
+    n_idx = len(snap)
+    dates = sectors.week_end_dates(data, latest, weeks)
+    hist = sectors.rank_history(data, dates, days_3m, basis).reindex(snap.index)
     prev_pos = hist.iloc[:, -2] if hist.shape[1] >= 2 else pd.Series(np.nan, index=hist.index)
 
     basis_label = next(k for k, v in BASIS.items() if v == basis)
-    st.markdown(f"**As of {latest:%d %b %Y}** · ranked by **{basis_label}** · 3M = {days_3m} days. "
+    st.markdown(f"**As of {latest:%d %b %Y}** · {n_idx} indices ranked by **{basis_label}** · 3M = {days_3m} days. "
                 f"Leaders: **{', '.join(snap.index[:3])}**.")
-    notes_html = "<br>".join(re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", n) for n in rotation_notes(hist))
+    notes_html = "<br>".join(re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", n) for n in sectors.rotation_notes(hist))
     st.markdown(f'<div class="remark">{notes_html}</div>', unsafe_allow_html=True)
     st.write("")
 
-    # ---- Sectors table (the 'Sectors' tab) -------------------------------------------
-    st.subheader("Sector ranking (your 'Sectors' tab, always sorted)")
+    # ---- ranking table (the 'Sectors' tab) -----------------------------------------------
+    st.subheader("Index ranking (your 'Sectors' tab, always sorted)")
     tbl = pd.DataFrame({
         "Rank": snap["pos"], "Index": snap.index, "Type": snap["group"],
         "Δ rank 1W": (prev_pos - snap["pos"]).reindex(snap.index),
@@ -955,31 +856,34 @@ def page_sectors() -> None:
         "Off 52W High": snap["off_high"], "Rank(1,3,6)": snap["score"],
     })
     ret_cols = ["1W", "1M", "3M", "6M ex 1M", "6M", "1Y", "Away from 52W Low", "Off 52W High"]
-    sty = (tbl.style.map(_ret_color, subset=ret_cols).map(_pos_color, subset=["Rank"])
+    sty = (tbl.style.map(_ret_color, subset=ret_cols).map(lambda v: _pos_color(v, n_idx), subset=["Rank"])
            .map(lambda v: "color:#6b7280;font-style:italic" if v == "Benchmark" else "", subset=["Type"])
            .format({**{c: "{:+.2%}" for c in ret_cols}, "Close": "{:,.2f}", "52W High": "{:,.2f}",
                     "52W Low": "{:,.2f}", "Rank(1,3,6)": "{:.2f}",
                     "Δ rank 1W": lambda v: "" if pd.isna(v) else ("—" if v == 0 else f"{v:+.0f}")}, na_rep=""))
-    st.dataframe(sty, width="stretch", hide_index=True, height=640)
-    st.caption("Δ rank 1W: + = moved up the table since last week's close. Benchmarks (Nifty 50/200/500) are ranked "
-               "alongside, exactly as in your sheet.")
+    st.dataframe(sty, width="stretch", hide_index=True, height=min(40 + 35 * n_idx, 720))
+    st.caption("Δ rank 1W: + = moved up the table since last week's close.")
 
-    # ---- Rank history heatmap (the 'Analysis' tab, transposed) -------------------------
+    # ---- strong stocks inside the strongest indices ----------------------------------------
+    _drilldown(snap, pages, top_k, {"threshold": rs_thr, "history": rs_hist, "use_ema": rs_ema,
+                                     "cr": rs_cr, "mr": rs_mr}, no_lenders)
+
+    # ---- rank history heatmap (the 'Analysis' tab, transposed) -----------------------------
     st.subheader(f"Rank history — last {len(dates)} weeks")
     cols = [d.strftime("%d %b %y") for d in hist.columns]
     z = hist.to_numpy(dtype=float)
     heat = go.Figure(go.Heatmap(
         z=z, x=cols, y=list(hist.index),
-        text=[[("" if np.isnan(v) else str(int(v))) for v in row] for row in z], texttemplate="%{text}", zmin=1, zmax=len(hist), showscale=False, xgap=2, ygap=2,
+        text=[[("" if np.isnan(v) else str(int(v))) for v in row] for row in z], texttemplate="%{text}",
+        zmin=1, zmax=n_idx, showscale=False, xgap=2, ygap=2,
         colorscale=[[0, "#166534"], [0.25, "#4ade80"], [0.5, "#facc15"], [0.75, "#f87171"], [1, "#991b1b"]],
         hovertemplate="%{y}<br>%{x}: rank %{z}<extra></extra>"))
-    heat.update_layout(height=40 + 26 * len(hist), margin=dict(l=10, r=10, t=10, b=10),
+    heat.update_layout(height=60 + 22 * n_idx, margin=dict(l=10, r=10, t=10, b=10),
                        yaxis=dict(autorange="reversed"), xaxis=dict(side="top", type="category"))
     st.plotly_chart(heat, width="stretch")
     st.caption("Rows ordered by today's rank. Each column is the last trading day of that week; the newest column "
                "is the latest close (the current week is provisional until Friday).")
 
-    # ---- Bump chart -----------------------------------------------------------------
     st.subheader("Rank movement")
     pick = st.multiselect("Indices to plot", list(hist.index), default=list(snap.index[:5]))
     if pick:
@@ -987,20 +891,20 @@ def page_sectors() -> None:
         for s in pick:
             f.add_trace(go.Scatter(x=cols, y=hist.loc[s], mode="lines+markers", name=s,
                                    hovertemplate=f"{s}<br>%{{x}}: rank %{{y}}<extra></extra>"))
-        f.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10),
-                        yaxis=dict(range=[len(hist) + 0.5, 0.5], dtick=1, title="Rank (1 = best)"),
+        f.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10),
+                        yaxis=dict(range=[n_idx + 0.5, 0.5], title="Rank (1 = best)"),
                         xaxis=dict(type="category"), legend=dict(orientation="h", y=-0.2))
         st.plotly_chart(f, width="stretch")
 
-    # ---- Sheet-style Analysis grid --------------------------------------------------
-    grid = pd.DataFrame({c: hist[d].dropna().sort_values().index.to_list() for c, d in zip(cols, hist.columns)})
+    grid = pd.DataFrame({c: pd.Series(hist[d].dropna().sort_values().index.to_list())
+                         for c, d in zip(cols, hist.columns)})
     grid.index = range(1, len(grid) + 1)
     grid.index.name = "Rank"
+    palette = {n: SECTOR_COLORS[i % len(SECTOR_COLORS)] for i, n in enumerate(sorted(hist.index))}
     with st.expander("Sheet-style view (same layout as your 'Analysis' tab)"):
-        st.dataframe(grid.style.map(lambda v: f"background-color:{SECTOR_COLOR.get(v, '')};color:#111827"),
+        st.dataframe(grid.style.map(lambda v: f"background-color:{palette.get(v, '')};color:#111827"),
                      width="stretch", height=40 + 35 * len(grid))
 
-    # ---- Downloads ---------------------------------------------------------------------
     xbuf = io.BytesIO()
     with pd.ExcelWriter(xbuf, engine="openpyxl") as xw:
         tbl.to_excel(xw, sheet_name="Sectors", index=False)
@@ -1011,25 +915,150 @@ def page_sectors() -> None:
     d1, d2 = st.columns(2)
     d1.download_button("Download Excel (Sectors + Analysis)", xbuf.getvalue(), f"sector_rotation_{latest:%Y%m%d}.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
-    d2.download_button("Download CSV (Sectors)", tbl.to_csv(index=False).encode(), f"sectors_{latest:%Y%m%d}.csv",
+    d2.download_button("Download CSV (index ranking)", tbl.to_csv(index=False).encode(), f"sectors_{latest:%Y%m%d}.csv",
                        "text/csv", width="stretch")
 
+    _coverage_panel(catalog, discovery, status, names)
     with st.expander("How the numbers are calculated"):
         st.markdown(textwrap.dedent(f"""
+        **Index ranking**
         - **Returns** follow your sheet: today's close ÷ the first close on or after (as-of date − N calendar days) − 1,
-          with N = 7 (1W), 30 (1M), **{days_3m} (3M)**, 180 (6M), 365 (1Y). The as-of date is the last close, not the
-          calendar date, so a weekend view still compares Friday with Friday.
-        - **6M ex 1M** = close 1 month ago ÷ close 6 months ago − 1. Your sheet subtracts the two percentages (6M − 1M),
-          which is slightly off; this is the compounded version.
-        - **52W High / Low**: highest daily high and lowest daily low of the last 365 days (Google's high52 / low52 work the same way).
+          with N = 7 (1W), 30 (1M), **{days_3m} (3M)**, 180 (6M), 365 (1Y). The as-of date is the last close.
+        - **6M ex 1M** = close 1 month ago ÷ close 6 months ago − 1 (compounded; your sheet subtracts the two percentages).
+        - **52W High / Low**: highest daily high and lowest daily low of the last 365 days.
         - **Rank(1,3,6)** = 0.5 × rank of 1M + 0.3 × rank of 3M + 0.2 × rank of 6M, each rank 1 = best (Google's RANK,
-          ties share a rank). **Lower is better.** Ties are broken by the better 1M return.
-        - **Rank history**: the same calculation repeated as of the last trading day of each past week, so the
-          'Analysis' tab fills itself in instead of being copied by hand.
-        - Data: niftyindices.com daily OHLC (official); Yahoo Finance used only if niftyindices fails for an index.
+          ties share a rank), among the indices included. **Lower is better.** Ties go to the better 1M return.
+        - **Rank history**: the same calculation as of the last trading day of each past week.
+
+        **Strong stocks** — the screener of the Abu Abdullah RS Leaderboard, same defaults:
+        - RS = stock's month-end close ÷ Nifty 50's month-end close. **RS ratio** = this month's RS ÷ its highest
+          month-end value of the last 12 months (100% = new 12-month RS high).
+        - Listed only if, on the latest month (usually still running, so **provisional**): close ≥ 12-month EMA,
+          closing range ≥ {rs_cr}%, monthly return ≥ {rs_mr}%; and RS ratio ≥ {rs_thr}% in at least one of the
+          last {rs_hist} months. Dark cells = 100% (new high), light cells = at or above the threshold.
+        - Order: marked in the latest month first, then the longest run of marked months, then RS ratio, then closing range.
+        - Lending companies are left out with the same rule as that app (NSE basic industry, or name-based fallback).
+        - Prices: Yahoo Finance monthly, 3 years, adjusted for splits and dividends. Constituents: the official list on
+          each index's page at niftyindices.com.
         """))
-    st.caption("Data — " + " · ".join(f"{k}: {v}" for k, v in src.items())
-               + f" · Rendered {datetime.now(IST):%d %b %Y %H:%M} IST")
+    st.caption(f"Data: niftyindices.com (index prices and constituents), Yahoo Finance (stock prices) · "
+               f"Rendered {datetime.now(IST):%d %b %Y %H:%M} IST")
+
+
+def _drilldown(snap: pd.DataFrame, pages: dict, top_k: int, p: dict, no_lenders: bool) -> None:
+    st.subheader("Strong stocks in the strongest indices")
+    eligible = [n for n in snap.index if sectors.GROUP.get(n) != "Benchmark" and pages.get(n)]
+    default = [n for n in eligible if not (no_lenders and n in sectors.LENDER_INDICES)][:top_k]
+    chosen = st.multiselect("Indices to drill into (default: the top-ranked ones"
+                            + (", skipping bank / NBFC / housing-finance indices while lenders are excluded)"
+                               if no_lenders else ")"),
+                            eligible, default=default, key=f"drill_{no_lenders}_{'-'.join(default)}")
+    if not chosen:
+        st.info("Pick at least one index.")
+        return
+    members, info, errors = {}, {}, []
+    for n in chosen:
+        try:
+            df, src = cached_constituents(n, pages[n])
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{n}: {e}")
+            continue
+        for _, r in df.iterrows():
+            members.setdefault(r["Symbol"], []).append(n)
+            info.setdefault(r["Symbol"], (str(r.get("Company Name", "")), str(r.get("Industry", ""))))
+    if errors:
+        st.warning("Constituent list not available for: " + "; ".join(errors))
+    if not members:
+        return
+    symbols = sorted(members)
+    excluded = []
+    if no_lenders:
+        res = lender_filter.classify(symbols, {s: info[s][0] for s in symbols}, {s: info[s][1] for s in symbols},
+                                     lender_cache(), cached_nbfc_index())
+        drop = {r["symbol"] for r in res["excluded"]}
+        excluded = res["excluded"]
+        symbols = [s for s in symbols if s not in drop]
+    if not symbols:
+        st.info("Every stock in these indices is a lending company, which is excluded (switch in the sidebar).")
+        return
+    try:
+        monthly = cached_monthly(tuple(symbols))
+        if monthly is None or monthly.empty or rs_leaders.INDEX_TICKER not in monthly["Close"].columns:
+            raise RuntimeError("Yahoo Finance returned no prices (it may be throttling); try again in a minute")
+        res, labels = rs_leaders.screen(monthly, p)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Could not run the RS screen: {e}")
+        return
+    last_m = monthly["Close"].dropna(how="all").index[-1]
+    running = (last_m.year, last_m.month) == (date.today().year, date.today().month)
+    st.markdown(f"{len(members)} stocks in **{', '.join(chosen)}**"
+                + (f", {len(excluded)} lending companies left out" if excluded else "")
+                + f" → **{len(res)}** pass the RS-leadership screen"
+                + (f" ({last_m:%b %Y} is still running, so the latest month is provisional)." if running else "."))
+    if res.empty:
+        return
+    out = pd.DataFrame({
+        "Symbol": res["symbol"],
+        "Company": [info.get(s, ("", ""))[0] for s in res["symbol"]],
+        "Industry": [info.get(s, ("", ""))[1] for s in res["symbol"]],
+        "In strong indices": [", ".join(members[s]) for s in res["symbol"]],
+    })
+    for i, lab in enumerate(labels):
+        out[lab] = [c[i][0] for c in res["cells"]]
+    out["Run"] = res["run"]
+    out["Close in range"] = res["cr"]
+    out["Month return"] = res["mr"]
+    out["vs 12M EMA"] = res["ema_gap"]
+    out["Price"] = res["price"]
+
+    def style_frame(df):
+        s = pd.DataFrame("", index=df.index, columns=df.columns)
+        for i, cells in enumerate(res["cells"]):
+            for j, lab in enumerate(labels):
+                s.iloc[i, df.columns.get_loc(lab)] = _rs_cell_style(cells[j][2], cells[j][1])
+        multi = df["In strong indices"].str.contains(",")
+        s.loc[multi, "In strong indices"] = "font-weight:600"
+        return s
+
+    sty = (out.style.apply(style_frame, axis=None)
+           .format({**{lab: (lambda v: "" if pd.isna(v) else ("100" if v >= 100 else f"{int(v)}")) for lab in labels},
+                    "Close in range": "{:.0%}", "Month return": "{:+.1%}", "vs 12M EMA": "{:+.1%}",
+                    "Price": "{:,.2f}"}, na_rep=""))
+    st.dataframe(sty, width="stretch", hide_index=True, height=min(40 + 35 * len(out), 640))
+    st.caption("Month cells = RS ratio (% of its 12-month high). Dark = 100 (new 12-month RS high); light = at or above "
+               "the threshold; grey = below. Bold index list = member of more than one strong index. "
+               "Run = consecutive marked months ending with the latest.")
+    st.download_button("Download strong stocks (CSV)", out.to_csv(index=False).encode(),
+                       f"strong_stocks_{last_m:%Y%m}.csv", "text/csv")
+    if excluded:
+        with st.expander(f"Lending companies left out ({len(excluded)})"):
+            st.dataframe(pd.DataFrame(excluded)[["symbol", "name", "label", "source"]], hide_index=True, width="stretch")
+
+
+def _coverage_panel(catalog, discovery, status, names) -> None:
+    with st.expander(f"Index list and data status ({len(catalog)} indices)"):
+        st.markdown(f"**Included:** every NSE sectoral and thematic index, plus Nifty 50 / 200 / 500 as benchmarks — "
+                    f"checked against niftyindices.com on 22 Nov 2026; new NSE indices are picked up automatically "
+                    f"({discovery['note']}).")
+        if discovery["new"]:
+            st.markdown("**New since 22 Nov 2026 (added automatically):** "
+                        + ", ".join(f"{n} ({g})" for n, g, _ in discovery["new"]))
+        ex = {n: why for n, why in discovery["excluded"]}
+        rows = [(n, why) for n, why in ex.items()] or [(r, w) for r, w in sectors.EXCLUDE_RULES]
+        st.markdown("**Left out on purpose:**")
+        st.dataframe(pd.DataFrame(rows, columns=["Index (or pattern)", "Why"]), hide_index=True, width="stretch")
+        st.markdown("**BSE:** every BSE sectoral and thematic index duplicates an NSE index already here, or mixes "
+                    "sectors already covered — except " + "; ".join(f"**{n}**: {w}" for n, w in sectors.BSE_NOT_ADDED)
+                    + ".")
+        st.markdown("**Data status of each index:**")
+        st.dataframe(pd.DataFrame([{"Index": n, "Group": sectors.GROUP.get(n, ""),
+                                    "Source": status.get(n, {}).get("source", "not requested"),
+                                    "API name used": status.get(n, {}).get("api", ""),
+                                    "Days of data": status.get(n, {}).get("rows", 0),
+                                    "Last date": status.get(n, {}).get("last"),
+                                    "Note": status.get(n, {}).get("note", "")}
+                                   for n, _, _ in catalog]),
+                     hide_index=True, width="stretch")
 
 
 # ════════════════════════════════════════════════════════════════════════════
