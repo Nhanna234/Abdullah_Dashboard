@@ -31,15 +31,15 @@ import json
 import os
 import re
 import tempfile
-import textwrap
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 import lender_filter
 import rs_leaders
@@ -423,296 +423,6 @@ def build_table(px: pd.DataFrame, breadth: pd.DataFrame | None, dt_mode: str, cf
 # 3b. SECTOR ROTATION — engine in sectors.py (index list, prices, Rank(1,3,6)) and rs_leaders.py
 #     (Abu Abdullah RS screen for the strongest indices' stocks); this file only draws the page.
 # ════════════════════════════════════════════════════════════════════════════
-SECTOR_COLORS = ["#fde68a", "#bfdbfe", "#fecaca", "#bbf7d0", "#ddd6fe", "#fed7aa", "#a5f3fc", "#fbcfe8",
-                 "#d9f99d", "#e9d5ff", "#99f6e4", "#fecdd3", "#c7d2fe", "#fef08a", "#e5e7eb", "#d6d3d1", "#cbd5e1"]
-BASIS = {"Composite Rank(1,3,6) — as in your sheet": "composite",
-         "3M return": "r_3m",
-         "Away from 52W low": "away_low"}
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 4. PAGE
-# ════════════════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="Indian Market Breadth Tracker", page_icon="📊", layout="wide")
-
-st.markdown("""
-<style>
-.chip{display:inline-block;padding:1px 10px;border-radius:999px;font-weight:600;font-size:0.85rem;white-space:nowrap}
-.remark{padding:12px 14px;border-left:4px solid #94a3b8;background:rgba(148,163,184,.12);border-radius:6px;line-height:1.55}
-.small{color:#6b7280;font-size:0.85rem}
-</style>""", unsafe_allow_html=True)
-
-
-def chip(text: str, bg: str, fg: str) -> str:
-    return f'<span class="chip" style="background:{bg};color:{fg}">{text}</span>'
-
-
-def page_breadth() -> None:
-    with st.sidebar:
-        st.header("Settings")
-        window_days = st.slider("Display window (calendar days)", 30, 180, 90, step=10)
-        DT_OPTIONS = {
-            f"Fresh 3M low within last {CFG['latch']} sessions (recommended)": "latch",
-            "Close is the 3M low today (literal)": "strict",
-            f"Close within {CFG['tol_pct']:g}% of 3M low": "tol",
-        }
-        dt_mode = DT_OPTIONS[st.radio("Downtrend test ('at a 3-month low')", list(DT_OPTIONS), index=0)]
-        use_breadth = st.toggle("Include Nifty 500 breadth (% above 50 DMA)", value=True,
-                                help="Downloads ~500 stock histories; first load takes up to ~90 s, then cached for 6 h.")
-        if st.button("Refresh data now", width="stretch"):
-            st.cache_data.clear()
-            st.rerun()
-        st.caption("A trading day's closes are picked up after 5:00 pm IST. Index data re-checked hourly, "
-                   "stocks every 6 h (and again after each close), constituent list daily.")
-
-    data_end = last_complete_session_date()                  # IST-based, never includes a live intraday bar
-    idx_start = data_end - timedelta(days=window_days + 420)  # EMA warm-up + 3M low + window
-    stk_start = data_end - timedelta(days=window_days + 120)  # 50 DMA needs ~75 calendar days
-
-    st.title("Indian market breadth tracker")
-
-    try:
-        px, src = load_indices(idx_start, data_end)
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Could not load index data: {e}")
-        st.stop()
-
-    breadth, breadth_note = None, ""
-    if use_breadth:
-        try:
-            members = load_nifty500_symbols()
-            syms = tuple(sorted(members["Symbol"].astype(str).str.strip().unique()))
-            closes = load_stock_closes(syms, stk_start, data_end)
-            closes = closes[closes.index <= pd.Timestamp(data_end)]
-            got = closes.notna().any().sum()
-            breadth = pct_above_dma(closes, CFG["dma"])
-            breadth_note = f"{got} of {len(syms)} Nifty 500 stocks downloaded."
-            if got < 0.9 * len(syms):
-                breadth_note += " Coverage is below 90% — treat the breadth % with care."
-        except Exception as e:  # noqa: BLE001
-            breadth_note = f"Breadth unavailable this load: {e}"
-
-    full = build_table(px, breadth, dt_mode, CFG)
-    cutoff = pd.Timestamp(full.index.max()) - pd.Timedelta(days=window_days)
-    view = full[full.index > cutoff]
-    last = view.iloc[-1]
-    asof = view.index[-1]
-
-    # ---- headline -----------------------------------------------------------------
-    st.markdown(
-        f"**As of {asof:%d %b %Y}** the market reads "
-        f"{chip(last.regime, POSTURE_COLOR[last.posture], POSTURE_TEXT[last.posture])} with posture "
-        f"{chip(last.posture, POSTURE_COLOR[last.posture], POSTURE_TEXT[last.posture])} — unchanged for "
-        f"**{int(last.streak)}** sessions. Breadth score **{int(last.score)}** (−6 to +6)"
-        + (f" · **{last.breadth_pct:.0f}%** of Nifty 500 above {CFG['dma']} DMA "
-           f"({last.breadth_zone}, {last.breadth_check.lower()})" if not pd.isna(last.breadth_pct) else "")
-        + ".", unsafe_allow_html=True)
-    st.markdown(f'<div class="remark">{last.remark}</div>', unsafe_allow_html=True)
-    st.write("")
-
-    # ---- cards --------------------------------------------------------------------
-    cols = st.columns(4)
-    for col, k in zip(cols[:3], INDICES):
-        with col, st.container(border=True):
-            s_ = last[f"{k}_state"]
-            st.markdown(f"**{INDICES[k][1]}** &nbsp; {chip(s_, STATE_COLOR[s_], STATE_TEXT[s_])}", unsafe_allow_html=True)
-            prev_close = view[k].iloc[-2] if len(view) > 1 else np.nan
-            st.metric("Close", f"{last[k]:,.2f}", f"{(last[k] / prev_close - 1) * 100:+.2f}% day", label_visibility="collapsed")
-            st.markdown(
-                f"<div class='small'>vs {CFG['ema_fast']} EMA: <b>{last[f'{k}_vs_f']:+.2f}%</b><br>"
-                f"vs {CFG['ema_slow']} EMA: <b>{last[f'{k}_vs_s']:+.2f}%</b><br>"
-                f"{CFG['ema_fast']} EMA vs {CFG['ema_slow']} EMA: <b>{last[f'{k}_fs']:+.2f}%</b><br>"
-                f"Above 3M closing low: <b>{last[f'{k}_off_low']:+.2f}%</b><br>"
-                f"Sessions in this state: <b>{int(last[f'{k}_days'])}</b></div>", unsafe_allow_html=True)
-    with cols[3], st.container(border=True):
-        st.markdown("**Nifty 500 breadth**")
-        if pd.isna(last.breadth_pct):
-            st.metric("% above 50 DMA", "—", label_visibility="collapsed")
-            st.caption(breadth_note or "Breadth switched off.")
-        else:
-            dlt = last.breadth_delta
-            st.metric("% above 50 DMA", f"{last.breadth_pct:.1f}%",
-                      None if pd.isna(dlt) else f"{dlt:+.1f} pts / {CFG['breadth_delta_n']}d", label_visibility="collapsed")
-            st.markdown(f"<div class='small'>Zone: <b>{last.breadth_zone}</b><br>Check vs regime: <b>{last.breadth_check}</b><br>"
-                        f"Stocks counted: <b>{int(last.breadth_n)}</b></div>", unsafe_allow_html=True)
-
-    # ---- heatmap ------------------------------------------------------------------
-    st.subheader(f"Trend state by day — last {window_days} days")
-    rows = ["Nifty 50", "Midcap 150", "Smallcap 250", "Regime posture"]
-    state_codes = {"S-UT": 4, "UT": 3, "TZ": 2, "DT": 1, "S-DT": 0}
-    posture_codes = {"Risk-on": 4, "Constructive": 3.5, "Selective": 2, "Cautious": 1.5, "Defensive": 1, "Risk-off": 0}
-    z = [[state_codes[v] for v in view[f"{k}_state"]] for k in INDICES] + [[posture_codes[v] for v in view["posture"]]]
-    txt = [list(view[f"{k}_state"]) for k in INDICES] + [list(view["regime"] + " · " + view["posture"])]
-    scale = [[0.0, "#991b1b"], [0.125, "#991b1b"], [0.125, "#f87171"], [0.3, "#f87171"],
-             [0.3, "#fb923c"], [0.42, "#fb923c"], [0.42, "#facc15"], [0.6, "#facc15"],
-             [0.6, "#4ade80"], [0.94, "#4ade80"], [0.94, "#166534"], [1.0, "#166534"]]
-    xcat = list(view.index.strftime("%d %b %y"))
-    heat = go.Figure(go.Heatmap(z=z[::-1], x=xcat, y=rows[::-1], text=txt[::-1], zmin=0, zmax=4,
-                                colorscale=scale, showscale=False, xgap=1, ygap=3,
-                                hovertemplate="%{x}<br>%{y}: %{text}<extra></extra>"))
-    heat.update_layout(height=230, margin=dict(l=10, r=10, t=10, b=10),
-                       xaxis=dict(showgrid=False, type="category", nticks=8), yaxis=dict(showgrid=False))
-    st.plotly_chart(heat, width="stretch")
-    st.markdown(" ".join(chip(s, STATE_COLOR[s], STATE_TEXT[s]) for s in SCORE) + " &nbsp;·&nbsp; Posture: " +
-                " ".join(chip(p, POSTURE_COLOR[p], POSTURE_TEXT[p]) for p in POSTURE_COLOR), unsafe_allow_html=True)
-
-    # ---- score + breadth ----------------------------------------------------------
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Breadth score (index trend states)")
-        f = go.Figure(go.Bar(x=view.index, y=view["score"],
-                             marker_color=["#16a34a" if v > 0 else "#dc2626" if v < 0 else "#9ca3af" for v in view["score"]],
-                             hovertemplate="%{x|%d %b %Y}: %{y}<extra></extra>"))
-        f.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), yaxis=dict(range=[-6.5, 6.5], dtick=2),
-                        xaxis=dict(rangebreaks=[dict(bounds=["sat", "mon"])]))
-        st.plotly_chart(f, width="stretch")
-    with c2:
-        st.subheader(f"% of Nifty 500 above {CFG['dma']} DMA")
-        if view["breadth_pct"].notna().any():
-            f = go.Figure()
-            bands = [(0, 20, "rgba(153,27,27,.12)"), (20, 40, "rgba(248,113,113,.10)"), (40, 60, "rgba(250,204,21,.10)"),
-                     (60, 80, "rgba(74,222,128,.10)"), (80, 100, "rgba(22,101,52,.12)")]
-            for lo, hi, colr in bands:
-                f.add_hrect(y0=lo, y1=hi, fillcolor=colr, line_width=0)
-            f.add_trace(go.Scatter(x=view.index, y=view["breadth_pct"], mode="lines", line=dict(width=2.5, color="#2563eb"),
-                                   hovertemplate="%{x|%d %b %Y}: %{y:.1f}%<extra></extra>"))
-            th = view[view["thrust"]]
-            if len(th):
-                f.add_trace(go.Scatter(x=th.index, y=th["breadth_pct"], mode="markers", marker=dict(size=10, color="#16a34a"),
-                                       name="Breadth thrust", hovertemplate="Thrust %{x|%d %b}<extra></extra>"))
-            f.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), yaxis=dict(range=[0, 100], ticksuffix="%"),
-                            showlegend=False, xaxis=dict(rangebreaks=[dict(bounds=["sat", "mon"])]))
-            st.plotly_chart(f, width="stretch")
-        else:
-            st.info(breadth_note or "Breadth switched off in the sidebar.")
-
-    # ---- price vs EMAs ------------------------------------------------------------
-    st.subheader("Index vs its EMAs (strip = daily state)")
-    pc = st.columns(3)
-    for col, k in zip(pc, INDICES):
-        with col:
-            f = go.Figure()
-            f.add_trace(go.Scatter(x=view.index, y=view[k], name="Close", line=dict(width=2, color="#111827")))
-            f.add_trace(go.Scatter(x=view.index, y=view[f"{k}_ema_f"], name=f"{CFG['ema_fast']} EMA", line=dict(width=1.5, color="#3b82f6")))
-            f.add_trace(go.Scatter(x=view.index, y=view[f"{k}_ema_s"], name=f"{CFG['ema_slow']} EMA",
-                                   line=dict(width=1.5, color="#f59e0b", dash="dash")))
-            lo_ = view[[k, f"{k}_ema_f", f"{k}_ema_s"]].min().min()
-            hi_ = view[[k, f"{k}_ema_f", f"{k}_ema_s"]].max().max()
-            pad = (hi_ - lo_) * 0.08
-            f.add_trace(go.Bar(x=view.index, y=[pad * 0.6] * len(view), base=lo_ - pad,
-                               marker_color=[STATE_COLOR[s] for s in view[f"{k}_state"]], showlegend=False,
-                               hovertext=list(view[f"{k}_state"]), hoverinfo="text+x"))
-            f.update_layout(title=INDICES[k][1], height=300, margin=dict(l=10, r=10, t=40, b=10), bargap=0,
-                            legend=dict(orientation="h", y=-0.15), yaxis=dict(range=[lo_ - pad, hi_ + pad / 2]),
-                            hovermode="x unified", xaxis=dict(rangebreaks=[dict(bounds=["sat", "mon"])]))
-            st.plotly_chart(f, width="stretch")
-
-    # ---- daily log ----------------------------------------------------------------
-    st.subheader("Daily log with remarks (newest first)")
-    log = view.sort_index(ascending=False).reset_index()
-    show = pd.DataFrame({
-        "Date": log["date"].dt.strftime("%d %b %Y"),
-        "Nifty 50": log["n50_state"], "Midcap 150": log["mid_state"], "Smallcap 250": log["sml_state"],
-        "Score": log["score"], "Δ score": log["d_score"],
-        "% > 50 DMA": log["breadth_pct"].round(1), "Breadth check": log["breadth_check"],
-        "Regime": log["regime"], "Posture": log["posture"], "Remarks": log["remark"],
-    })
-
-
-    def _style(v):
-        if v in STATE_COLOR:
-            return f"background-color:{STATE_COLOR[v]};color:{STATE_TEXT[v]};font-weight:600"
-        if v in POSTURE_COLOR:
-            return f"background-color:{POSTURE_COLOR[v]};color:{POSTURE_TEXT[v]};font-weight:600"
-        if v in CHECK_COLOR:
-            return f"background-color:{CHECK_COLOR[v]};color:#111827"
-        return ""
-
-
-    styled = (show.style.map(_style, subset=["Nifty 50", "Midcap 150", "Smallcap 250", "Posture", "Breadth check"])
-              .format({"Δ score": lambda v: "" if pd.isna(v) else f"{v:+.0f}",
-                       "% > 50 DMA": lambda v: "" if pd.isna(v) else f"{v:.1f}%"}))
-    st.dataframe(styled, width="stretch", hide_index=True, height=520,
-                 column_config={"Remarks": st.column_config.TextColumn(width="large")})
-
-    xbuf = io.BytesIO()
-    export = view.reset_index()
-    export["date"] = export["date"].dt.date
-    with pd.ExcelWriter(xbuf, engine="openpyxl") as xw:
-        export.to_excel(xw, sheet_name="Daily", index=False)
-        pd.DataFrame(list(CFG.items()), columns=["setting", "value"]).astype(str).to_excel(xw, sheet_name="Rules", index=False)
-    d1, d2 = st.columns(2)
-    d1.download_button("Download Excel", xbuf.getvalue(), f"market_breadth_{asof:%Y%m%d}.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
-    d2.download_button("Download CSV", export.to_csv(index=False).encode(), f"market_breadth_{asof:%Y%m%d}.csv",
-                       "text/csv", width="stretch")
-
-    # ---- rules + sources -----------------------------------------------------------
-    with st.expander("Rules used", expanded=False):
-        F, S, L = CFG["ema_fast"], CFG["ema_slow"], CFG["lookback"]
-        st.markdown(textwrap.dedent(f"""
-    **1. Trend state of each index (daily closes)**
-    - **S-UT**: close above both the {F} EMA and the {S} EMA, *and* the {F} EMA above the {S} EMA.
-    - **UT**: close above the {S} EMA but at or below the {F} EMA (pullback inside an uptrend).
-      Also UT: close above both EMAs while the {F} EMA is still at or below the {S} EMA (early, unconfirmed uptrend).
-    - **DT**: close at or below the {S} EMA *and* at a 3-month low.
-    - **S-DT**: {"DT, and also " if CFG["sdt_needs_3m_low"] else ""}close below both the {F} EMA and the {S} EMA, *and* the {F} EMA below the {S} EMA.
-      Otherwise a DT day stays DT (e.g. below both EMAs but the {F} EMA still above the {S} EMA: a fresh breakdown).
-    - **TZ**: everything else (below the {S} EMA, not DT).
-    - 3-month low = lowest close of the last {L} sessions. Recommended test: a fresh low within the last {CFG['latch']} sessions;
-      literal: today's close is the low; tolerance: within {CFG['tol_pct']:g}% of it.
-
-    **2. Breadth score** — S-UT +2, UT +1, TZ 0, DT −1, S-DT −2, summed (−6 to +6), indices weighted equally.
-
-    **3. Regime and posture (first match wins)**
-    1. All three uptrend → Broad uptrend (strong if all S-UT) → Risk-on
-    2. All three DT → Broad downtrend (strong if all S-DT) → Risk-off
-    3. ≥1 uptrend and ≥1 downtrend → Divergent → Cautious
-    4. Only Nifty 50 up → Narrow: large-caps only → Cautious
-    5. Nifty 50 + one broader index up → Breadth narrowing → Selective
-    6. Mid & small up, Nifty 50 not → Broader market leading → Constructive
-    7. Only one of mid/small up → Mixed → Selective
-    8. None up, none DT → Correction / no trend → Defensive
-    9. None up, one or two DT → Weakening → Defensive
-
-    **4. Nifty 500 participation** — % of current Nifty 500 members closing above their own {CFG['dma']}-day simple MA.
-    - Zones: ≥80 Overheated · 60–80 Healthy · 40–60 Neutral · 20–40 Weak · <20 Washed-out.
-    - Breadth check: in Risk-on / Constructive regimes, ≥{CFG['breadth_confirm_up']}% confirms and <{CFG['breadth_diverge_up']}% diverges;
-      in Defensive / Risk-off regimes, ≤{CFG['breadth_confirm_dn']}% confirms and ≥{CFG['breadth_diverge_dn']}% diverges; otherwise neutral.
-    - Breadth thrust (simplified): breadth goes from below {CFG['thrust_from']}% to above {CFG['thrust_to']}% within {CFG['thrust_n']} sessions.
-    - The breadth check is reported in the remark; it does not change the regime or posture.
-
-    **5. Remark** — regime meaning · strongest / weakest index vs {S} EMA · risk appetite · that day's events
-    (EMA crosses, fresh 3M lows) · participation and breadth check · score trajectory (±{CFG['traj_thresh']} in {CFG['traj_n']} sessions).
-
-    *Posture is a rules output, not investment advice.*
-    """))
-
-    st.caption("Data — " + " · ".join(f"{INDICES[k][1]}: {v}" for k, v in src.items())
-               + (f" · Breadth: Yahoo Finance adjusted closes; constituents from niftyindices.com. {breadth_note}" if use_breadth else "")
-               + f" · Rendered {datetime.now(IST):%d %b %Y %H:%M} IST")
-
-
-def _ret_color(v):
-    """Green for gains, red for losses; stronger colour for bigger moves (no matplotlib needed)."""
-    if pd.isna(v):
-        return ""
-    a = min(abs(v) / 0.15, 1.0)                     # full colour at ±15%
-    rgb = (22, 163, 74) if v >= 0 else (220, 38, 38)
-    return f"background-color: rgba({rgb[0]},{rgb[1]},{rgb[2]},{0.12 + 0.55 * a:.2f})"
-
-
-def _pos_color(p, n=17):
-    if pd.isna(p):
-        return ""
-    x = (p - 1) / max(n - 1, 1)                     # 0 = best, 1 = worst
-    r, g = (int(22 + 233 * min(1, 2 * x)), int(163 + 60 * min(1, 2 * x))) if x <= 0.5 else \
-        (int(255 - 35 * (2 * x - 1)), int(223 - 185 * (2 * x - 1)))
-    b = 74 if x <= 0.5 else int(80 - 42 * (2 * x - 1))
-    txt = "#ffffff" if x < 0.15 or x > 0.85 else "#111827"
-    return f"background-color: rgb({r},{g},{b}); color: {txt}"
-
-
 # ---- cached data for the Sector rotation page (the work itself is in sectors.py and rs_leaders.py)
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def cached_discovery() -> dict:
@@ -772,300 +482,260 @@ def lender_cache():
                                             fetch_one=(lambda s: None) if OFFLINE_DIR else None)
 
 
-def _rs_cell_style(marked_high, marked):
-    if marked_high:
-        return "background-color:#0e7490;color:#ffffff;font-weight:600"
-    if marked:
-        return "background-color:#a5f3fc;color:#0f172a"
-    return "color:#9ca3af"
+
+# ════════════════════════════════════════════════════════════════════════════
+# 4. DATA FOR THE WEBSITE — Python computes, the React front end (frontend/, built into
+#    frontend/dist) draws. Each page asks for what it needs; results are kept per visitor.
+# ════════════════════════════════════════════════════════════════════════════
+def _j(v):
+    """JSON-safe value: NaN/inf -> None, numpy -> Python, timestamps -> 'YYYY-MM-DD'."""
+    if v is None:
+        return None
+    if isinstance(v, (pd.Timestamp, datetime, date)):
+        return pd.Timestamp(v).strftime("%Y-%m-%d")
+    if isinstance(v, (np.bool_, bool)):
+        return bool(v)
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        return None if not np.isfinite(v) else round(float(v), 6)
+    return v
 
 
-def page_sectors() -> None:
+def _rec(d: dict) -> dict:
+    return {k: _j(v) for k, v in d.items()}
+
+
+DT_MODES = {"latch": f"Fresh 3-month low within the last {CFG['latch']} sessions",
+            "strict": "Today's close is the 3-month low",
+            "tol": f"Close within {CFG['tol_pct']:g}% of the 3-month low"}
+
+
+def breadth_payload(window_days: int, dt_mode: str, use_breadth: bool) -> dict:
+    data_end = last_complete_session_date()
+    idx_start = data_end - timedelta(days=window_days + 420)   # EMA warm-up + 3M low + window
+    stk_start = data_end - timedelta(days=window_days + 120)   # 50 DMA needs ~75 calendar days
+    try:
+        px, src = load_indices(idx_start, data_end)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"Could not load the index closes: {e}"}
+    breadth, note = None, ""
+    if use_breadth:
+        try:
+            members = load_nifty500_symbols()
+            syms = tuple(sorted(members["Symbol"].astype(str).str.strip().unique()))
+            closes = load_stock_closes(syms, stk_start, data_end)
+            closes = closes[closes.index <= pd.Timestamp(data_end)]
+            got = int(closes.notna().any().sum())
+            breadth = pct_above_dma(closes, CFG["dma"])
+            note = f"{got} of {len(syms)} Nifty 500 stocks downloaded."
+            if got < 0.9 * len(syms):
+                note += " Coverage is below 90%, so treat the breadth figure with care."
+        except Exception as e:  # noqa: BLE001
+            note = f"Breadth is unavailable on this load: {e}"
+    full = build_table(px, breadth, dt_mode, CFG)
+    view = full[full.index > pd.Timestamp(full.index.max()) - pd.Timedelta(days=window_days)]
+    rows = [_rec({"date": d, **r}) for d, r in view.reset_index().set_index("date").to_dict("index").items()]
+    prev_close = {k: _j(view[k].iloc[-2]) if len(view) > 1 else None for k in INDICES}
+    return {"ok": True, "asOf": _j(view.index[-1]), "rows": rows, "prevClose": prev_close,
+            "indices": {k: v[1] for k, v in INDICES.items()},
+            "sources": {INDICES[k][1]: v for k, v in src.items()}, "breadthNote": note,
+            "settings": {"window": window_days, "dtMode": dt_mode, "useBreadth": use_breadth},
+            "cfg": {k: v for k, v in CFG.items() if k != "breadth_zones"},
+            "zones": [[lo, lab] for lo, lab in CFG["breadth_zones"]],
+            "rendered": datetime.now(IST).strftime("%d %b %Y, %H:%M IST")}
+
+
+def _catalog() -> tuple[list, dict]:
     discovery = cached_discovery()
     for n, g, _ in discovery["new"]:
         sectors.GROUP.setdefault(n, g)
-    catalog = sectors.CATALOG + [tuple(x) for x in discovery["new"]]
-    pages = {n: p for n, _, p in catalog}
+    return sectors.CATALOG + [tuple(x) for x in discovery["new"]], discovery
 
-    with st.sidebar:
-        st.header("Sector settings")
-        groups = st.multiselect("Include", ["Sector", "Theme", "Benchmark"], default=["Sector", "Theme", "Benchmark"],
-                                help="Sector = NSE sectoral indices, Theme = NSE thematic indices, "
-                                     "Benchmark = Nifty 50 / 200 / 500.")
-        weeks = st.slider("Weeks of rank history", 4, sectors.SECTOR_CFG["max_weeks"], 12)
-        basis = BASIS[st.radio("Rank by", list(BASIS), index=0)]
-        lb = st.radio("3M return lookback", ["90 days (a true 3 months)", "60 days (what my Google Sheet uses)"],
-                      index=0, help="Your sheet's '3M Return' formula uses TODAY()-60, i.e. 2 months.")
-        days_3m = sectors.SECTOR_CFG["days_3m_true"] if lb.startswith("90") else sectors.SECTOR_CFG["days_3m_sheet"]
-        with st.expander("Strong-stock drill-down (Abu Abdullah RS rules)", expanded=False):
-            top_k = st.slider("Strongest indices to drill into", 1, 10, 3)
-            rs_thr = st.number_input("RS threshold %", 50, 100, rs_leaders.RS_DEFAULTS["threshold"], step=1)
-            rs_hist = st.slider("Months shown", 3, 12, rs_leaders.RS_DEFAULTS["history"])
-            rs_ema = st.toggle("Close above 12-month EMA", value=rs_leaders.RS_DEFAULTS["use_ema"])
-            rs_cr = st.number_input("Min closing range %", 0, 100, rs_leaders.RS_DEFAULTS["cr"], step=5)
-            rs_mr = st.number_input("Min monthly return %", -50, 100, rs_leaders.RS_DEFAULTS["mr"], step=1)
-            no_lenders = st.toggle("Exclude lending companies", value=True,
-                                   help="Banks, NBFCs, housing finance and financial institutions are left out "
-                                        "(same rule as the Abu Abdullah app).")
-        if st.button("Refresh data now", width="stretch", key="sec_refresh"):
-            st.cache_data.clear()
-            st.rerun()
-        st.caption("Closes are picked up after 5:00 pm IST; index data re-checked hourly.")
 
-    st.title("Sector rotation")
-    if not groups:
-        st.info("Choose at least one group in the sidebar.")
-        st.stop()
-    names = tuple(n for n, g, _ in catalog if g in groups)
+def sector_payload(groups: list, weeks: int, basis: str, days_3m: int) -> dict:
+    catalog, discovery = _catalog()
+    names = [n for n, g, _ in catalog if g in groups]
     data_end = last_complete_session_date()
     data, status = cached_index_prices(tuple(n for n, _, _ in catalog),
                                        data_end - timedelta(days=sectors.SECTOR_CFG["history_days"]), data_end)
+    coverage = {
+        "checked": "22 Nov 2026", "discoveryNote": discovery["note"],
+        "newFound": [{"name": n, "group": g} for n, g, _ in discovery["new"]],
+        "excluded": [{"name": n, "why": w} for n, w in discovery["excluded"]]
+                    or [{"name": p, "why": w} for p, w in sectors.EXCLUDE_RULES],
+        "bse": [{"name": n, "why": w} for n, w in sectors.BSE_NOT_ADDED],
+        "status": [_rec({"name": n, "group": g, "source": status.get(n, {}).get("source", "not requested"),
+                         "api": status.get(n, {}).get("api", ""), "rows": status.get(n, {}).get("rows", 0),
+                         "last": status.get(n, {}).get("last"), "note": status.get(n, {}).get("note", "")})
+                   for n, g, _ in catalog],
+    }
     data = {n: d for n, d in data.items() if n in names}
-    failed = [n for n in names if n not in data]
     if not data:
-        st.error("Could not load any index from niftyindices.com. Open 'Index list and data status' below for details.")
-    if failed:
-        st.warning(f"{len(failed)} of {len(names)} indices did not load this time and are left out of the ranking: "
-                   + ", ".join(failed))
-    if not data:
-        _coverage_panel(catalog, discovery, status, names)
-        st.stop()
-
+        return {"ok": False, "error": "No index could be loaded from niftyindices.com. The data status list below "
+                                      "shows what each index returned.", "coverage": coverage}
     latest = max(df.index.max() for df in data.values())
     snap = sectors.order_by(sectors.sector_snapshot(data, latest, days_3m), basis)
-    n_idx = len(snap)
     dates = sectors.week_end_dates(data, latest, weeks)
     hist = sectors.rank_history(data, dates, days_3m, basis).reindex(snap.index)
-    prev_pos = hist.iloc[:, -2] if hist.shape[1] >= 2 else pd.Series(np.nan, index=hist.index)
-
-    basis_label = next(k for k, v in BASIS.items() if v == basis)
-    st.markdown(f"**As of {latest:%d %b %Y}** · {n_idx} indices ranked by **{basis_label}** · 3M = {days_3m} days. "
-                f"Leaders: **{', '.join(snap.index[:3])}**.")
-    notes_html = "<br>".join(re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", n) for n in sectors.rotation_notes(hist))
-    st.markdown(f'<div class="remark">{notes_html}</div>', unsafe_allow_html=True)
-    st.write("")
-
-    # ---- ranking table (the 'Sectors' tab) -----------------------------------------------
-    st.subheader("Index ranking (your 'Sectors' tab, always sorted)")
-    tbl = pd.DataFrame({
-        "Rank": snap["pos"], "Index": snap.index, "Type": snap["group"],
-        "Δ rank 1W": (prev_pos - snap["pos"]).reindex(snap.index),
-        "Close": snap["close"], "52W High": snap["high_52w"], "52W Low": snap["low_52w"],
-        "1W": snap["r_1w"], "1M": snap["r_1m"], "3M": snap["r_3m"], "6M ex 1M": snap["r_6m_ex_1m"],
-        "6M": snap["r_6m"], "1Y": snap["r_1y"], "Away from 52W Low": snap["away_low"],
-        "Off 52W High": snap["off_high"], "Rank(1,3,6)": snap["score"],
-    })
-    ret_cols = ["1W", "1M", "3M", "6M ex 1M", "6M", "1Y", "Away from 52W Low", "Off 52W High"]
-    sty = (tbl.style.map(_ret_color, subset=ret_cols).map(lambda v: _pos_color(v, n_idx), subset=["Rank"])
-           .map(lambda v: "color:#6b7280;font-style:italic" if v == "Benchmark" else "", subset=["Type"])
-           .format({**{c: "{:+.2%}" for c in ret_cols}, "Close": "{:,.2f}", "52W High": "{:,.2f}",
-                    "52W Low": "{:,.2f}", "Rank(1,3,6)": "{:.2f}",
-                    "Δ rank 1W": lambda v: "" if pd.isna(v) else ("—" if v == 0 else f"{v:+.0f}")}, na_rep=""))
-    st.dataframe(sty, width="stretch", hide_index=True, height=min(40 + 35 * n_idx, 720))
-    st.caption("Δ rank 1W: + = moved up the table since last week's close.")
-
-    # ---- strong stocks inside the strongest indices ----------------------------------------
-    _drilldown(snap, pages, top_k, {"threshold": rs_thr, "history": rs_hist, "use_ema": rs_ema,
-                                     "cr": rs_cr, "mr": rs_mr}, no_lenders)
-
-    # ---- rank history heatmap (the 'Analysis' tab, transposed) -----------------------------
-    st.subheader(f"Rank history — last {len(dates)} weeks")
-    cols = [d.strftime("%d %b %y") for d in hist.columns]
-    z = hist.to_numpy(dtype=float)
-    heat = go.Figure(go.Heatmap(
-        z=z, x=cols, y=list(hist.index),
-        text=[[("" if np.isnan(v) else str(int(v))) for v in row] for row in z], texttemplate="%{text}",
-        zmin=1, zmax=n_idx, showscale=False, xgap=2, ygap=2,
-        colorscale=[[0, "#166534"], [0.25, "#4ade80"], [0.5, "#facc15"], [0.75, "#f87171"], [1, "#991b1b"]],
-        hovertemplate="%{y}<br>%{x}: rank %{z}<extra></extra>"))
-    heat.update_layout(height=60 + 22 * n_idx, margin=dict(l=10, r=10, t=10, b=10),
-                       yaxis=dict(autorange="reversed"), xaxis=dict(side="top", type="category"))
-    st.plotly_chart(heat, width="stretch")
-    st.caption("Rows ordered by today's rank. Each column is the last trading day of that week; the newest column "
-               "is the latest close (the current week is provisional until Friday).")
-
-    st.subheader("Rank movement")
-    pick = st.multiselect("Indices to plot", list(hist.index), default=list(snap.index[:5]))
-    if pick:
-        f = go.Figure()
-        for s in pick:
-            f.add_trace(go.Scatter(x=cols, y=hist.loc[s], mode="lines+markers", name=s,
-                                   hovertemplate=f"{s}<br>%{{x}}: rank %{{y}}<extra></extra>"))
-        f.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10),
-                        yaxis=dict(range=[n_idx + 0.5, 0.5], title="Rank (1 = best)"),
-                        xaxis=dict(type="category"), legend=dict(orientation="h", y=-0.2))
-        st.plotly_chart(f, width="stretch")
-
-    grid = pd.DataFrame({c: pd.Series(hist[d].dropna().sort_values().index.to_list())
-                         for c, d in zip(cols, hist.columns)})
-    grid.index = range(1, len(grid) + 1)
-    grid.index.name = "Rank"
-    palette = {n: SECTOR_COLORS[i % len(SECTOR_COLORS)] for i, n in enumerate(sorted(hist.index))}
-    with st.expander("Sheet-style view (same layout as your 'Analysis' tab)"):
-        st.dataframe(grid.style.map(lambda v: f"background-color:{palette.get(v, '')};color:#111827"),
-                     width="stretch", height=40 + 35 * len(grid))
-
-    xbuf = io.BytesIO()
-    with pd.ExcelWriter(xbuf, engine="openpyxl") as xw:
-        tbl.to_excel(xw, sheet_name="Sectors", index=False)
-        grid.to_excel(xw, sheet_name="Analysis")
-        h = hist.copy()
-        h.columns = cols
-        h.to_excel(xw, sheet_name="Rank history")
-    d1, d2 = st.columns(2)
-    d1.download_button("Download Excel (Sectors + Analysis)", xbuf.getvalue(), f"sector_rotation_{latest:%Y%m%d}.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
-    d2.download_button("Download CSV (index ranking)", tbl.to_csv(index=False).encode(), f"sectors_{latest:%Y%m%d}.csv",
-                       "text/csv", width="stretch")
-
-    _coverage_panel(catalog, discovery, status, names)
-    with st.expander("How the numbers are calculated"):
-        st.markdown(textwrap.dedent(f"""
-        **Index ranking**
-        - **Returns** follow your sheet: today's close ÷ the first close on or after (as-of date − N calendar days) − 1,
-          with N = 7 (1W), 30 (1M), **{days_3m} (3M)**, 180 (6M), 365 (1Y). The as-of date is the last close.
-        - **6M ex 1M** = close 1 month ago ÷ close 6 months ago − 1 (compounded; your sheet subtracts the two percentages).
-        - **52W High / Low**: highest daily high and lowest daily low of the last 365 days.
-        - **Rank(1,3,6)** = 0.5 × rank of 1M + 0.3 × rank of 3M + 0.2 × rank of 6M, each rank 1 = best (Google's RANK,
-          ties share a rank), among the indices included. **Lower is better.** Ties go to the better 1M return.
-        - **Rank history**: the same calculation as of the last trading day of each past week.
-
-        **Strong stocks** — the screener of the Abu Abdullah RS Leaderboard, same defaults:
-        - RS = stock's month-end close ÷ Nifty 50's month-end close. **RS ratio** = this month's RS ÷ its highest
-          month-end value of the last 12 months (100% = new 12-month RS high).
-        - Listed only if, on the latest month (usually still running, so **provisional**): close ≥ 12-month EMA,
-          closing range ≥ {rs_cr}%, monthly return ≥ {rs_mr}%; and RS ratio ≥ {rs_thr}% in at least one of the
-          last {rs_hist} months. Dark cells = 100% (new high), light cells = at or above the threshold.
-        - Order: marked in the latest month first, then the longest run of marked months, then RS ratio, then closing range.
-        - Lending companies are left out with the same rule as that app (NSE basic industry, or name-based fallback).
-        - Prices: Yahoo Finance monthly, 3 years, adjusted for splits and dividends. Constituents: the official list on
-          each index's page at niftyindices.com.
-        """))
-    st.caption(f"Data: niftyindices.com (index prices and constituents), Yahoo Finance (stock prices) · "
-               f"Rendered {datetime.now(IST):%d %b %Y %H:%M} IST")
+    prev = hist.iloc[:, -2] if hist.shape[1] >= 2 else pd.Series(np.nan, index=hist.index)
+    pages = {n: p for n, _, p in catalog}
+    rows = []
+    for name, r in snap.iterrows():
+        rows.append(_rec({"name": name, "group": r["group"], "pos": r["pos"], "prevPos": prev.get(name),
+                          "close": r["close"], "high52": r["high_52w"], "low52": r["low_52w"],
+                          "r1w": r["r_1w"], "r1m": r["r_1m"], "r3m": r["r_3m"], "r6mx1m": r["r_6m_ex_1m"],
+                          "r6m": r["r_6m"], "r1y": r["r_1y"], "awayLow": r["away_low"], "offHigh": r["off_high"],
+                          "score": r["score"], "drillable": bool(pages.get(name))})
+                    | {"trail": [_j(v) for v in hist.loc[name].tolist()]})
+    return {"ok": True, "asOf": _j(latest), "rows": rows, "weeks": [_j(d) for d in hist.columns],
+            "notes": sectors.rotation_notes(hist), "coverage": coverage,
+            "failed": [n for n in names if n not in data],
+            "lenderIndices": sorted(sectors.LENDER_INDICES),
+            "settings": {"groups": groups, "weeks": weeks, "basis": basis, "days3m": days_3m},
+            "cfg": {k: v for k, v in sectors.SECTOR_CFG.items() if k != "days"} | {"days": sectors.SECTOR_CFG["days"]},
+            "rendered": datetime.now(IST).strftime("%d %b %Y, %H:%M IST")}
 
 
-def _drilldown(snap: pd.DataFrame, pages: dict, top_k: int, p: dict, no_lenders: bool) -> None:
-    st.subheader("Strong stocks in the strongest indices")
-    eligible = [n for n in snap.index if sectors.GROUP.get(n) != "Benchmark" and pages.get(n)]
-    default = [n for n in eligible if not (no_lenders and n in sectors.LENDER_INDICES)][:top_k]
-    chosen = st.multiselect("Indices to drill into (default: the top-ranked ones"
-                            + (", skipping bank / NBFC / housing-finance indices while lenders are excluded)"
-                               if no_lenders else ")"),
-                            eligible, default=default, key=f"drill_{no_lenders}_{'-'.join(default)}")
-    if not chosen:
-        st.info("Pick at least one index.")
-        return
+def drill_payload(chosen: list, p: dict, no_lenders: bool) -> dict:
+    catalog, _ = _catalog()
+    pages = {n: pg for n, _, pg in catalog}
     members, info, errors = {}, {}, []
     for n in chosen:
+        if not pages.get(n):
+            continue
         try:
-            df, src = cached_constituents(n, pages[n])
+            df, _src = cached_constituents(n, pages[n])
         except Exception as e:  # noqa: BLE001
             errors.append(f"{n}: {e}")
             continue
         for _, r in df.iterrows():
             members.setdefault(r["Symbol"], []).append(n)
             info.setdefault(r["Symbol"], (str(r.get("Company Name", "")), str(r.get("Industry", ""))))
-    if errors:
-        st.warning("Constituent list not available for: " + "; ".join(errors))
+    base = {"ok": True, "indices": chosen, "errors": errors, "settings": {**p, "noLenders": no_lenders},
+            "members": len(members), "excluded": [], "stocks": [], "labels": [], "provisional": False}
     if not members:
-        return
+        return {**base, "ok": not errors, "error": "No constituent list could be loaded." if errors else None}
     symbols = sorted(members)
-    excluded = []
     if no_lenders:
         res = lender_filter.classify(symbols, {s: info[s][0] for s in symbols}, {s: info[s][1] for s in symbols},
                                      lender_cache(), cached_nbfc_index())
         drop = {r["symbol"] for r in res["excluded"]}
-        excluded = res["excluded"]
+        base["excluded"] = [{"symbol": r["symbol"], "name": r["name"], "label": r["label"], "source": r["source"]}
+                            for r in res["excluded"]]
         symbols = [s for s in symbols if s not in drop]
     if not symbols:
-        st.info("Every stock in these indices is a lending company, which is excluded (switch in the sidebar).")
-        return
+        return base
     try:
         monthly = cached_monthly(tuple(symbols))
         if monthly is None or monthly.empty or rs_leaders.INDEX_TICKER not in monthly["Close"].columns:
-            raise RuntimeError("Yahoo Finance returned no prices (it may be throttling); try again in a minute")
+            raise RuntimeError("Yahoo Finance returned no prices (it may be busy); try again in a minute")
         res, labels = rs_leaders.screen(monthly, p)
     except Exception as e:  # noqa: BLE001
-        st.error(f"Could not run the RS screen: {e}")
-        return
+        return {**base, "ok": False, "error": f"The RS screen could not run: {e}"}
     last_m = monthly["Close"].dropna(how="all").index[-1]
-    running = (last_m.year, last_m.month) == (date.today().year, date.today().month)
-    st.markdown(f"{len(members)} stocks in **{', '.join(chosen)}**"
-                + (f", {len(excluded)} lending companies left out" if excluded else "")
-                + f" → **{len(res)}** pass the RS-leadership screen"
-                + (f" ({last_m:%b %Y} is still running, so the latest month is provisional)." if running else "."))
-    if res.empty:
-        return
-    out = pd.DataFrame({
-        "Symbol": res["symbol"],
-        "Company": [info.get(s, ("", ""))[0] for s in res["symbol"]],
-        "Industry": [info.get(s, ("", ""))[1] for s in res["symbol"]],
-        "In strong indices": [", ".join(members[s]) for s in res["symbol"]],
-    })
-    for i, lab in enumerate(labels):
-        out[lab] = [c[i][0] for c in res["cells"]]
-    out["Run"] = res["run"]
-    out["Close in range"] = res["cr"]
-    out["Month return"] = res["mr"]
-    out["vs 12M EMA"] = res["ema_gap"]
-    out["Price"] = res["price"]
-
-    def style_frame(df):
-        s = pd.DataFrame("", index=df.index, columns=df.columns)
-        for i, cells in enumerate(res["cells"]):
-            for j, lab in enumerate(labels):
-                s.iloc[i, df.columns.get_loc(lab)] = _rs_cell_style(cells[j][2], cells[j][1])
-        multi = df["In strong indices"].str.contains(",")
-        s.loc[multi, "In strong indices"] = "font-weight:600"
-        return s
-
-    sty = (out.style.apply(style_frame, axis=None)
-           .format({**{lab: (lambda v: "" if pd.isna(v) else ("100" if v >= 100 else f"{int(v)}")) for lab in labels},
-                    "Close in range": "{:.0%}", "Month return": "{:+.1%}", "vs 12M EMA": "{:+.1%}",
-                    "Price": "{:,.2f}"}, na_rep=""))
-    st.dataframe(sty, width="stretch", hide_index=True, height=min(40 + 35 * len(out), 640))
-    st.caption("Month cells = RS ratio (% of its 12-month high). Dark = 100 (new 12-month RS high); light = at or above "
-               "the threshold; grey = below. Bold index list = member of more than one strong index. "
-               "Run = consecutive marked months ending with the latest.")
-    st.download_button("Download strong stocks (CSV)", out.to_csv(index=False).encode(),
-                       f"strong_stocks_{last_m:%Y%m}.csv", "text/csv")
-    if excluded:
-        with st.expander(f"Lending companies left out ({len(excluded)})"):
-            st.dataframe(pd.DataFrame(excluded)[["symbol", "name", "label", "source"]], hide_index=True, width="stretch")
-
-
-def _coverage_panel(catalog, discovery, status, names) -> None:
-    with st.expander(f"Index list and data status ({len(catalog)} indices)"):
-        st.markdown(f"**Included:** every NSE sectoral and thematic index, plus Nifty 50 / 200 / 500 as benchmarks — "
-                    f"checked against niftyindices.com on 22 Nov 2026; new NSE indices are picked up automatically "
-                    f"({discovery['note']}).")
-        if discovery["new"]:
-            st.markdown("**New since 22 Nov 2026 (added automatically):** "
-                        + ", ".join(f"{n} ({g})" for n, g, _ in discovery["new"]))
-        ex = {n: why for n, why in discovery["excluded"]}
-        rows = [(n, why) for n, why in ex.items()] or [(r, w) for r, w in sectors.EXCLUDE_RULES]
-        st.markdown("**Left out on purpose:**")
-        st.dataframe(pd.DataFrame(rows, columns=["Index (or pattern)", "Why"]), hide_index=True, width="stretch")
-        st.markdown("**BSE:** every BSE sectoral and thematic index duplicates an NSE index already here, or mixes "
-                    "sectors already covered — except " + "; ".join(f"**{n}**: {w}" for n, w in sectors.BSE_NOT_ADDED)
-                    + ".")
-        st.markdown("**Data status of each index:**")
-        st.dataframe(pd.DataFrame([{"Index": n, "Group": sectors.GROUP.get(n, ""),
-                                    "Source": status.get(n, {}).get("source", "not requested"),
-                                    "API name used": status.get(n, {}).get("api", ""),
-                                    "Days of data": status.get(n, {}).get("rows", 0),
-                                    "Last date": status.get(n, {}).get("last"),
-                                    "Note": status.get(n, {}).get("note", "")}
-                                   for n, _, _ in catalog]),
-                     hide_index=True, width="stretch")
+    today = datetime.now(IST).date()
+    stocks = [_rec({"symbol": r["symbol"], "company": info.get(r["symbol"], ("", ""))[0],
+                    "industry": info.get(r["symbol"], ("", ""))[1], "run": r["run"], "cr": r["cr"], "mr": r["mr"],
+                    "emaGap": r["ema_gap"], "price": r["price"]})
+              | {"indices": members.get(r["symbol"], []), "cells": [[_j(v), bool(m), bool(h)] for v, m, h in r["cells"]]}
+              for _, r in res.iterrows()] if not res.empty else []
+    return {**base, "labels": labels, "stocks": stocks, "checked": len(symbols),
+            "provisional": (last_m.year, last_m.month) == (today.year, today.month), "lastMonth": _j(last_m)}
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 5. NAVIGATION — two pages in one app
+# 5. PAGES — one React component draws both; Streamlit's own chrome is hidden
 # ════════════════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="Abdullah Dashboard", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
+st.markdown("""
+<style>
+  header[data-testid="stHeader"], [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
+  [data-testid="stToolbar"], footer { display: none !important; }
+  .stApp { background: #EEF1EE; }
+  .block-container, [data-testid="stMainBlockContainer"] { padding: 0 !important; max-width: 100% !important; }
+  iframe { display: block; }
+  [data-testid="stAlert"], [data-testid="stProgress"] { margin: 10px 24px 0; }
+</style>
+""", unsafe_allow_html=True)
+
+FRONTEND_DIR = Path(__file__).parent / "frontend" / "dist"
+dashboard = components.declare_component("abdullah_dashboard", path=str(FRONTEND_DIR)) \
+    if (FRONTEND_DIR / "index.html").exists() else None
+
+DEFAULTS = {
+    "breadth": {"window": 90, "dtMode": "latch", "useBreadth": True},
+    "sectors": {"groups": ["Sector", "Theme", "Benchmark"], "weeks": 12, "basis": "composite",
+                "days3m": sectors.SECTOR_CFG["days_3m_true"]},
+    "drill": {"topK": 3, "noLenders": True, **{k: v for k, v in rs_leaders.RS_DEFAULTS.items() if k != "lookback"}},
+    "dtModes": DT_MODES,
+    "bases": {"composite": "Rank(1,3,6), as in your sheet", "r_3m": "3M return", "away_low": "Away from 52W low"},
+    "days3m": {"true": sectors.SECTOR_CFG["days_3m_true"], "sheet": sectors.SECTOR_CFG["days_3m_sheet"]},
+    "maxWeeks": sectors.SECTOR_CFG["max_weeks"],
+}
+
+
+def _handle(request: dict, page_objects: dict) -> None:
+    kind = request.get("kind")
+    if kind == "goto":
+        st.switch_page(page_objects[request.get("page", "breadth")])
+    if kind == "refresh":
+        st.cache_data.clear()
+        for k in ("breadth", "sectors", "drill"):
+            st.session_state.pop(k, None)
+        st.rerun()
+    note = st.empty()
+    note.info({"breadth": "Working out market breadth. The first load of the day downloads about 500 stock "
+                          "histories and can take a minute or two.",
+               "sectors": "Ranking the sector and thematic indices. The first load can take about a minute.",
+               "drill": "Screening the stocks of the chosen indices with the RS rules."}.get(kind, "Working…"))
+    try:
+        if kind == "breadth":
+            out = breadth_payload(int(request.get("window", 90)), request.get("dtMode", "latch"),
+                                  bool(request.get("useBreadth", True)))
+        elif kind == "sectors":
+            groups = [g for g in request.get("groups", []) if g in ("Sector", "Theme", "Benchmark")] or ["Sector"]
+            weeks = max(4, min(int(request.get("weeks", 12)), sectors.SECTOR_CFG["max_weeks"]))
+            basis = request.get("basis") if request.get("basis") in ("composite", "r_3m", "away_low") else "composite"
+            out = sector_payload(groups, weeks, basis, int(request.get("days3m", 90)))
+        elif kind == "drill":
+            p = {"threshold": float(request.get("threshold", 100)), "history": int(request.get("history", 6)),
+                 "use_ema": bool(request.get("use_ema", True)), "cr": float(request.get("cr", 75)),
+                 "mr": float(request.get("mr", 5))}
+            out = drill_payload(list(request.get("indices", []))[:10], p, bool(request.get("noLenders", True)))
+        else:
+            out = {"ok": False, "error": f"Unknown request '{kind}'."}
+    except Exception as e:  # noqa: BLE001
+        out = {"ok": False, "error": f"Something went wrong: {type(e).__name__}: {e}"}
+    note.empty()
+    out["nonce"] = request.get("nonce")
+    st.session_state[kind] = out
+    st.rerun()
+
+
+def render(page: str, page_objects: dict) -> None:
+    if dashboard is None:
+        st.error("The website files are missing (frontend/dist). Build them with: cd frontend && npm install && npm run build")
+        st.stop()
+    request = dashboard(page=page, defaults=DEFAULTS, breadth=st.session_state.get("breadth"),
+                        sectors=st.session_state.get("sectors"), drill=st.session_state.get("drill"),
+                        key=f"dash_{page}", default=None)
+    if request and request.get("nonce") and request["nonce"] != st.session_state.get("last_nonce"):
+        st.session_state["last_nonce"] = request["nonce"]
+        _handle(request, page_objects)
+
+
+def page_breadth() -> None:
+    render("breadth", PAGE_OBJECTS)
+
+
+def page_sectors() -> None:
+    render("sectors", PAGE_OBJECTS)
+
+
 _default = os.environ.get("BREADTH_DEFAULT_PAGE", "breadth")   # only used for offline testing
-st.navigation([
-    st.Page(page_breadth, title="Market breadth", icon="📊", url_path="breadth", default=_default == "breadth"),
-    st.Page(page_sectors, title="Sector rotation", icon="🔄", url_path="sectors", default=_default == "sectors"),
-]).run()
+PAGE_OBJECTS = {
+    "breadth": st.Page(page_breadth, title="Market breadth", url_path="breadth", default=_default == "breadth"),
+    "sectors": st.Page(page_sectors, title="Sector rotation", url_path="sectors", default=_default == "sectors"),
+}
+st.navigation(list(PAGE_OBJECTS.values()), position="hidden").run()
