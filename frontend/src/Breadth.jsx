@@ -59,6 +59,8 @@ function BreadthBody({ d }) {
   const postureColor = POSTURE[last.posture] || POSTURE.Selective;
   const remarkParts = useMemo(() => last.remark.split(/(?<=\.)\s+(?=[A-Z])/).filter(Boolean), [last.remark]);
   const hasBreadth = last.breadth_pct != null;
+  const hasCross = last.ema_n != null && last.ema_n > 0;
+  const crossBack = rows.length > cfg.breadth_delta_n ? rows[rows.length - 1 - cfg.breadth_delta_n] : null;
 
   return (
     <>
@@ -72,6 +74,7 @@ function BreadthBody({ d }) {
             <div className="fact"><b>{last.streak}</b><span>sessions in this regime</span></div>
             <div className="fact"><b>{signed(last.score)}</b><span>breadth score (−6 to +6)</span></div>
             {hasBreadth && <div className="fact"><b>{num(last.breadth_pct, 0)}%</b><span>of Nifty 500 above {cfg.dma} DMA</span></div>}
+            {hasCross && <div className="fact"><b>{num(last.ema_above, 0)}</b><span>stocks with {cfg.cross_fast} EMA above {cfg.cross_slow} EMA</span></div>}
           </div>
         </div>
         <div className="remark">
@@ -127,6 +130,7 @@ function BreadthBody({ d }) {
                 <dt>Change in {cfg.breadth_delta_n} sessions</dt><dd>{last.breadth_delta == null ? "—" : `${signed(last.breadth_delta, 1)} pts`}</dd>
                 <dt>Against the regime</dt><dd>{last.breadth_check}</dd>
                 <dt>Stocks counted</dt><dd>{num(last.breadth_n, 0)}</dd>
+                {hasCross && <><dt>{cfg.cross_fast} EMA above {cfg.cross_slow} EMA</dt><dd>{num(last.ema_above, 0)} of {num(last.ema_n, 0)}</dd></>}
               </dl>
             </>
           ) : (
@@ -160,6 +164,30 @@ function BreadthBody({ d }) {
           ) : <p className="muted">{d.breadthNote || "Switched off above."}</p>}
         </div>
       </section>
+
+      {hasCross && (
+        <section className="section">
+          <div className="panel">
+            <div className="section-head" style={{ marginBottom: 4 }}>
+              <h3>Nifty 500 stocks with their {cfg.cross_fast}-day EMA above their {cfg.cross_slow}-day EMA</h3>
+              <span className="section-note">
+                <b style={{ color: "var(--ink)" }}>{num(last.ema_above, 0)} of {num(last.ema_n, 0)}</b> ({num(last.ema_pct, 1)}%) on {day(d.asOf)}
+                {crossBack?.ema_above != null && `, ${signed(last.ema_above - crossBack.ema_above)} in ${cfg.breadth_delta_n} sessions`}
+              </span>
+            </div>
+            <p className="section-note" style={{ marginBottom: 8 }}>
+              The longer-term trend under the surface: a stock whose {cfg.cross_fast} EMA is above its {cfg.cross_slow} EMA is in a medium-term uptrend. The dashed line marks half the index.
+            </p>
+            <LineChart
+              dates={dates} height={200} yFormat={(v) => `${num(v, 0)}%`}
+              series={[{ name: `${cfg.cross_fast} EMA above ${cfg.cross_slow} EMA`, values: rows.map((r) => r.ema_pct), color: "#0e6b3a", width: 2.2 }]}
+              bands={[{ label: "lower", from: 0, to: 50, color: "rgba(236,122,104,.07)" }, { label: "upper", from: 50, to: 100, color: "rgba(93,190,126,.08)" }]}
+              refLines={[50]}
+              extra={(i) => rows[i].ema_above == null ? null : <div>{num(rows[i].ema_above, 0)} of {num(rows[i].ema_n, 0)} stocks</div>}
+            />
+          </div>
+        </section>
+      )}
 
       <section className="section grid-4" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 380px), 1fr))" }}>
         {KEYS.map(([k, name]) => (
@@ -199,8 +227,10 @@ function DailyLog({ d }) {
   const rows = [...d.rows].reverse();
   const save = () =>
     downloadCSV(`market_breadth_${d.asOf}.csv`,
-      ["Date", "Nifty 50", "Midcap 150", "Smallcap 250", "Score", "Score change", "% above 50 DMA", "Breadth check", "Regime", "Posture", "Remark"],
-      rows.map((r) => [r.date, r.n50_state, r.mid_state, r.sml_state, r.score, r.d_score, r.breadth_pct?.toFixed(1), r.breadth_check, r.regime, r.posture, r.remark]));
+      ["Date", "Nifty 50", "Midcap 150", "Smallcap 250", "Score", "Score change", "% above 50 DMA", "Breadth check",
+        "Stocks with 50 EMA above 200 EMA", "Stocks counted", "% with 50 EMA above 200 EMA", "Regime", "Posture", "Remark"],
+      rows.map((r) => [r.date, r.n50_state, r.mid_state, r.sml_state, r.score, r.d_score, r.breadth_pct?.toFixed(1), r.breadth_check,
+        r.ema_above, r.ema_n, r.ema_pct?.toFixed(1), r.regime, r.posture, r.remark]));
   return (
     <section className="section">
       <div className="section-head">
@@ -212,7 +242,7 @@ function DailyLog({ d }) {
           <thead>
             <tr>
               <th className="sticky-col">Date</th><th>Nifty 50</th><th>Midcap 150</th><th>Smallcap 250</th>
-              <th className="num">Score</th><th className="num">Change</th><th className="num">&gt; 50 DMA</th><th>Breadth</th>
+              <th className="num">Score</th><th className="num">Change</th><th className="num">&gt; 50 DMA</th><th>Breadth</th><th className="num">50 EMA &gt; 200 EMA</th>
               <th>Regime</th><th>Posture</th><th>Remark</th>
             </tr>
           </thead>
@@ -227,6 +257,7 @@ function DailyLog({ d }) {
                 <td className="num">{r.d_score == null ? "" : signed(r.d_score)}</td>
                 <td className="num">{r.breadth_pct == null ? "" : `${num(r.breadth_pct, 1)}%`}</td>
                 <td>{r.breadth_check !== "n/a" && <Pill map={CHECK} value={r.breadth_check} />}</td>
+                <td className="num">{r.ema_above == null ? "" : `${num(r.ema_above, 0)} (${num(r.ema_pct, 0)}%)`}</td>
                 <td>{r.regime}</td>
                 <td><Pill map={POSTURE} value={r.posture} /></td>
                 <td className="wrap">{r.remark}</td>
@@ -272,6 +303,13 @@ function Rules({ cfg, zones }) {
           Share of today's Nifty 500 members closing above their own {cfg.dma}-day simple average. Zones: {zones.map(([lo, lab]) => `${lab} from ${lo}%`).join(", ")}.
           In Risk-on and Constructive regimes {cfg.breadth_confirm_up}% or more confirms and under {cfg.breadth_diverge_up}% diverges; in Defensive and Risk-off regimes {cfg.breadth_confirm_dn}% or less confirms and {cfg.breadth_diverge_dn}% or more diverges.
           A breadth thrust is a move from below {cfg.thrust_from}% to above {cfg.thrust_to}% within {cfg.thrust_n} sessions. Participation is reported in the remark; it does not change the regime.
+        </p>
+        <h4>{cfg.cross_fast} EMA above {cfg.cross_slow} EMA</h4>
+        <p>
+          For each of today's Nifty 500 members: is its {cfg.cross_fast}-day EMA of daily closes above its {cfg.cross_slow}-day EMA?
+          The count is out of the stocks that traded that day and have at least {cfg.cross_slow} sessions of history (newly listed stocks join once they do).
+          Each EMA starts from the average of the stock's first closes, the same method as the index EMAs, on about two years of Yahoo Finance prices adjusted for splits and bonuses.
+          It is shown for information and does not change the regime.
         </p>
         <h4>Remark</h4>
         <p>What the regime means, the strongest and weakest index against its {S} EMA, what that says about risk appetite, the day's events (EMA crosses, fresh 3-month lows), participation, and the score's change over {cfg.traj_n} sessions when it moves by {cfg.traj_thresh} or more.</p>

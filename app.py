@@ -68,6 +68,8 @@ CFG = {
     "traj_n": 5,               # sessions for score trajectory (Δ)
     "traj_thresh": 3,          # |Δ score| that counts as improving / deteriorating
     "dma": 50,                 # stock-level moving average for breadth (simple MA)
+    "cross_fast": 50,          # stock-level trend: count of Nifty 500 stocks whose 50-day EMA ...
+    "cross_slow": 200,         # ... is above their 200-day EMA
     "breadth_zones": [         # (lower bound %, label) — checked top-down
         (80, "Overheated"), (60, "Healthy"), (40, "Neutral"), (20, "Weak"), (0, "Washed-out")],
     "breadth_confirm_up": 50,  # up-regime confirmed if ≥ this % above 50 DMA
@@ -288,6 +290,30 @@ def pct_above_dma(closes: pd.DataFrame, n: int) -> pd.DataFrame:
     cnt = valid.sum(axis=1)
     pct = (above.sum(axis=1) / cnt.replace(0, np.nan)) * 100
     return pd.DataFrame({"breadth_pct": pct, "breadth_n": cnt})
+
+
+def _seeded_ema(c: pd.Series, n: int) -> pd.Series:
+    """EMA of one stock, started from the average of its first n closes (same method as the index EMAs).
+    Days before the stock has n closes stay empty, so newly listed stocks are not counted until then."""
+    valid = c.dropna()
+    if len(valid) < n:
+        return pd.Series(np.nan, index=c.index)
+    start = valid.index[n - 1]
+    s = c.copy()
+    s.loc[:start] = np.nan
+    s.loc[start] = valid.iloc[:n].mean()
+    return s.ewm(alpha=2 / (n + 1), adjust=False, ignore_na=True).mean()
+
+
+def ema_cross_breadth(closes: pd.DataFrame, fast: int, slow: int) -> pd.DataFrame:
+    """Per day: how many stocks have their fast EMA above their slow EMA, out of the stocks that traded
+    that day and have enough history for both EMAs."""
+    ef = closes.apply(lambda c: _seeded_ema(c, fast))
+    es = closes.apply(lambda c: _seeded_ema(c, slow))
+    valid = ef.notna() & es.notna() & closes.notna()
+    above = ((ef > es) & valid).sum(axis=1)
+    cnt = valid.sum(axis=1)
+    return pd.DataFrame({"ema_above": above, "ema_n": cnt, "ema_pct": above / cnt.replace(0, np.nan) * 100})
 
 
 def regime_of(st_: dict) -> tuple[str, str]:
@@ -524,12 +550,13 @@ DT_MODES = {"latch": f"Fresh 3-month low within the last {CFG['latch']} sessions
 def breadth_payload(window_days: int, dt_mode: str, use_breadth: bool) -> dict:
     data_end = last_complete_session_date()
     idx_start = data_end - timedelta(days=window_days + 420)   # EMA warm-up + 3M low + window
-    stk_start = data_end - timedelta(days=window_days + 120)   # 50 DMA needs ~75 calendar days
+    # stock history: about 2 years before the window, so each stock's 200-day EMA has settled
+    stk_start = data_end - timedelta(days=window_days + 760)
     try:
         px, src = load_indices(idx_start, data_end)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"Could not load the index closes: {e}"}
-    breadth, note = None, ""
+    breadth, cross, note = None, None, ""
     if use_breadth:
         try:
             members = load_nifty500_symbols()
@@ -538,6 +565,7 @@ def breadth_payload(window_days: int, dt_mode: str, use_breadth: bool) -> dict:
             closes = closes[closes.index <= pd.Timestamp(data_end)]
             got = int(closes.notna().any().sum())
             breadth = pct_above_dma(closes, CFG["dma"])
+            cross = ema_cross_breadth(closes, CFG["cross_fast"], CFG["cross_slow"])
             note = f"{got} of {len(syms)} Nifty 500 stocks downloaded."
             if got < 0.9 * len(syms):
                 note += " Coverage is below 90%, so treat the breadth figure with care."
@@ -545,6 +573,8 @@ def breadth_payload(window_days: int, dt_mode: str, use_breadth: bool) -> dict:
             note = f"Breadth is unavailable on this load: {e}"
     full = build_table(px, breadth, dt_mode, CFG)
     view = full[full.index > pd.Timestamp(full.index.max()) - pd.Timedelta(days=window_days)]
+    if cross is not None:
+        view = view.join(cross, how="left")
     rows = [_rec({"date": d, **r}) for d, r in view.reset_index().set_index("date").to_dict("index").items()]
     prev_close = {k: _j(view[k].iloc[-2]) if len(view) > 1 else None for k in INDICES}
     return {"ok": True, "asOf": _j(view.index[-1]), "rows": rows, "prevClose": prev_close,

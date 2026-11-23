@@ -75,7 +75,7 @@ export function Ribbon({ rows }) {
 }
 
 /* ---------- line chart: close vs EMAs, or any set of series ---------- */
-export function LineChart({ dates, series, height = 180, yFormat = (v) => num(v, 0), bands, refLines, markers, strip }) {
+export function LineChart({ dates, series, height = 180, yFormat = (v) => num(v, 0), bands, refLines, markers, strip, extra }) {
   const tip = useTip();
   const w = useWidth(tip.box);
   const all = series.flatMap((s) => s.values).filter((v) => v != null);
@@ -110,6 +110,7 @@ export function LineChart({ dates, series, height = 180, yFormat = (v) => num(v,
             {s.name} {s.values[i] == null ? "—" : yFormat(s.values[i])}
           </div>
         ))}
+        {extra && extra(i)}
         {strip && <div style={{ marginTop: 3 }}><Pill map={STATE} value={strip[i]} /></div>}
       </>
     ));
