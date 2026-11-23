@@ -81,7 +81,7 @@ function SectorBody({ d, args, ask, pending }) {
   const [rsSet, setRsSet] = useState(args.drill?.settings ? { ...ddef, ...args.drill.settings } : ddef);
   const loaded = new Set(rows.map((r) => r.name));
   const [picks, setPicks] = useState((args.drill?.indices || []).filter((x) => loaded.has(x)).length
-    ? args.drill.indices.filter((x) => loaded.has(x)) : defaultPicks(ddef.noLenders));
+    ? args.drill.indices.filter((x) => loaded.has(x)) : drillable.map((r) => r.name));   // default: every index
 
   // first visit: screen the default indices once the ranking is in
   useEffect(() => {
@@ -212,9 +212,9 @@ function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSe
   const busy = Boolean(pending.drill);
   const [adding, setAdding] = useState("");
   const [showAll, setShowAll] = useState(false);
-  const [currentOnly, setCurrentOnly] = useState(false);
+  const [currentOnly, setCurrentOnly] = useState(true);   // default: only stocks at or above the threshold this month
   const [openRow, setOpenRow] = useState(null);
-  const [chartMonths, setChartMonths] = useState(6);
+  const [chartMonths, setChartMonths] = useState(24);
   const lastLabel = r?.labels?.[r.labels.length - 1] || "the latest month";
   const stocks = r?.stocks ? (currentOnly ? r.stocks.filter((x) => x.cells[x.cells.length - 1]?.[1]) : r.stocks) : [];
   const chipsShown = showAll || picks.length <= 6 ? picks : picks.slice(0, 6);
