@@ -346,3 +346,74 @@ export function Bump({ rows, weeks, n, height = 300 }) {
     </div>
   );
 }
+
+/* ---------- a stock's relative strength against Nifty 50, with its 12-month high (as in Abu Abdullah) ---------- */
+export function RSChart({ trail, months }) {
+  const tip = useTip();
+  const w = useWidth(tip.box);
+  const k = Math.min(months, trail.rs.length);
+  const raw = trail.rs.slice(-k);
+  const rawHigh = trail.high.slice(-k);
+  const labels = trail.labels.slice(-k);
+  const base = raw.find((v) => v != null) || 1;
+  const rs = raw.map((v) => (v == null ? null : (v / base) * 100));
+  const high = rawHigh.map((v) => (v == null ? null : (v / base) * 100));
+  const isHigh = raw.map((v, i) => v != null && rawHigh[i] != null && v >= rawHigh[i] * 0.9995);
+  const H = 230;
+  const pad = { l: 44, r: 14, t: 12, b: 26 };
+  const all = [...rs, ...high].filter((v) => v != null);
+  const lo = Math.min(...all), hi = Math.max(...all);
+  const span = hi - lo || 1;
+  const yMin = lo - span * 0.1, yMax = hi + span * 0.1;
+  const iw = Math.max(w - pad.l - pad.r, 40);
+  const x = (i) => pad.l + (k > 1 ? (i / (k - 1)) * iw : iw / 2);
+  const y = (v) => pad.t + (1 - (v - yMin) / (yMax - yMin)) * (H - pad.t - pad.b);
+  const line = rs.map((v, i) => (v == null ? null : `${x(i).toFixed(1)},${y(v).toFixed(1)}`)).filter(Boolean).join(" L");
+  // the 12-month high only changes at month-ends, so it is drawn as steps
+  const steps = high.map((v, i) => (v == null ? "" : i === 0 ? `M${x(0).toFixed(1)},${y(v).toFixed(1)}` : `H${x(i).toFixed(1)} V${y(v).toFixed(1)}`)).join(" ");
+  const ticks = niceTicks(yMin, yMax, 4);
+  const every = k > 18 ? 3 : k > 9 ? 2 : 1;
+  const onMove = (e) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const i = Math.round(((e.clientX - r.left - pad.l) / iw) * (k - 1));
+    if (i < 0 || i >= k) return tip.hide();
+    tip.show(x(i), 0, (
+      <>
+        <div className="tip-date">{labels[i]}</div>
+        <div>Relative strength {rs[i] == null ? "—" : num(rs[i], 1)}</div>
+        <div>Highest of the past 12 months {high[i] == null ? "—" : num(high[i], 1)}</div>
+        <div>{rs[i] == null || high[i] == null ? "" : isHigh[i] ? "A new 12-month high" : `${num((rs[i] / high[i]) * 100, 0)}% of its 12-month high`}</div>
+      </>
+    ));
+  };
+  return (
+    <div>
+      <div className="legend" style={{ marginTop: 0, marginBottom: 6 }}>
+        <span><i className="line-key" style={{ borderColor: "#0f6b62" }} />Relative strength, start = 100</span>
+        <span><i className="line-key" style={{ borderColor: "#6b7a72", borderTopStyle: "dashed" }} />Highest of the past 12 months</span>
+        <span><i style={{ background: "#e39a1c", borderRadius: "50%" }} />New 12-month high</span>
+      </div>
+      <div className="chart" ref={tip.box} onMouseLeave={tip.hide}>
+        {w > 0 && (
+          <svg viewBox={`0 0 ${w} ${H}`} height={H} onMouseMove={onMove} role="img" aria-label="Relative strength against Nifty 50 with its 12-month high">
+            {ticks.map((t) => (
+              <g key={t}>
+                <line x1={pad.l} x2={pad.l + iw} y1={y(t)} y2={y(t)} stroke="var(--line-soft)" />
+                <text x={pad.l - 8} y={y(t) + 4} textAnchor="end">{Math.round(t)}</text>
+              </g>
+            ))}
+            {labels.map((l, i) => (k - 1 - i) % every === 0 && (
+              <text key={l} x={x(i)} y={H - 6} textAnchor={i === k - 1 ? "end" : i === 0 ? "start" : "middle"}>{l}</text>
+            ))}
+            <path d={steps} fill="none" stroke="#6b7a72" strokeWidth={1.5} strokeDasharray="5 4" />
+            <path d={`M${line}`} fill="none" stroke="#0f6b62" strokeWidth={2.4} strokeLinejoin="round" strokeLinecap="round" />
+            {rs.map((v, i) => v != null && isHigh[i] && (
+              <circle key={i} cx={x(i)} cy={y(v)} r={4.5} fill="#e39a1c" stroke="#fff" strokeWidth={1.5} />
+            ))}
+          </svg>
+        )}
+        {tip.node}
+      </div>
+    </div>
+  );
+}

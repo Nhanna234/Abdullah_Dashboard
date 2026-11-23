@@ -29,6 +29,7 @@ EMA_SPAN = 12
 INDEX_TICKER = "^NSEI"          # Nifty 50 price index on Yahoo: the denominator of relative strength
 SUFFIX = ".NS"
 PRICE_PERIOD = "3y"
+TRAIL_MONTHS = 24               # months of RS history sent for each listed stock's chart (as in the RS app)
 
 
 def one_row_per_month(data: pd.DataFrame) -> pd.DataFrame:
@@ -101,7 +102,11 @@ def screen(monthly: pd.DataFrame, p: dict | None = None) -> tuple[pd.DataFrame, 
             if not c[1]:
                 break
             run += 1
+        trail = rs.iloc[-TRAIL_MONTHS:]
+        trail_high = rs.rolling(n, min_periods=1).max().iloc[-TRAIL_MONTHS:]   # highest of the past 12 months
         rows.append({"symbol": ticker[:-len(SUFFIX)] if ticker.endswith(SUFFIX) else ticker,
+                     "trail": {"labels": [d.strftime("%b-%y") for d in trail.index],
+                               "rs": [float(v) for v in trail], "high": [float(v) for v in trail_high]},
                      "cells": cells, "run": run, "hits": sum(c[1] for c in cells),
                      "latest_ratio": cells[-1][0], "marked_latest": cells[-1][1], "price": float(curr),
                      "mr": float(mr), "cr": float(cr), "ema_gap": float(curr / ema12 - 1)})

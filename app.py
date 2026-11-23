@@ -681,7 +681,9 @@ def drill_payload(chosen: list, p: dict, no_lenders: bool) -> dict:
     stocks = [_rec({"symbol": r["symbol"], "company": info.get(r["symbol"], ("", ""))[0],
                     "industry": info.get(r["symbol"], ("", ""))[1], "run": r["run"], "cr": r["cr"], "mr": r["mr"],
                     "emaGap": r["ema_gap"], "price": r["price"]})
-              | {"indices": members.get(r["symbol"], []), "cells": [[_j(v), bool(m), bool(h)] for v, m, h in r["cells"]]}
+              | {"indices": members.get(r["symbol"], []), "cells": [[_j(v), bool(m), bool(h)] for v, m, h in r["cells"]],
+                 "trail": {"labels": r["trail"]["labels"], "rs": [_j(v) for v in r["trail"]["rs"]],
+                           "high": [_j(v) for v in r["trail"]["high"]]}}
               for _, r in res.iterrows()] if not res.empty else []
     return {**base, "labels": labels, "stocks": stocks, "checked": len(symbols),
             "provisional": (last_m.year, last_m.month) == (today.year, today.month), "lastMonth": _j(last_m)}

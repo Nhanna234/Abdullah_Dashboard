@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { Field, Seg, Toggle, day, downloadCSV, num, pct, rankColor, retStyle, useSort } from "./ui.jsx";
-import { Bump, RankHeat } from "./charts.jsx";
+import { Bump, RankHeat, RSChart } from "./charts.jsx";
 
 const GROUPS = [
   ["Sector", "Sectors"],
@@ -213,6 +213,8 @@ function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSe
   const [adding, setAdding] = useState("");
   const [showAll, setShowAll] = useState(false);
   const [currentOnly, setCurrentOnly] = useState(false);
+  const [openRow, setOpenRow] = useState(null);
+  const [chartMonths, setChartMonths] = useState(6);
   const lastLabel = r?.labels?.[r.labels.length - 1] || "the latest month";
   const stocks = r?.stocks ? (currentOnly ? r.stocks.filter((x) => x.cells[x.cells.length - 1]?.[1]) : r.stocks) : [];
   const chipsShown = showAll || picks.length <= 6 ? picks : picks.slice(0, 6);
@@ -296,14 +298,22 @@ function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSe
                   <table className="data">
                     <thead>
                       <tr>
-                        <th className="sticky-col">Stock</th><th>Industry</th><th>In leading indices</th>
+                        <th aria-label="Show chart" /><th className="sticky-col">Stock</th><th>Industry</th><th>In leading indices</th>
                         {r.labels.map((l) => <th key={l} className="num">{l}</th>)}
                         <th className="num">Run</th><th className="num">Close in range</th><th className="num">Month return</th><th className="num">vs 12M EMA</th><th className="num">Price</th>
                       </tr>
                     </thead>
                     <tbody>
                       {stocks.map((s) => (
-                        <tr key={s.symbol}>
+                        <Fragment key={s.symbol}>
+                        <tr className={openRow === s.symbol ? "is-open" : undefined}>
+                          <td>
+                            <button type="button" className="expander" aria-expanded={openRow === s.symbol}
+                              aria-label={`${openRow === s.symbol ? "Hide" : "Show"} the RS chart of ${s.symbol}`}
+                              onClick={() => setOpenRow((o) => (o === s.symbol ? null : s.symbol))}>
+                              {openRow === s.symbol ? "▾" : "▸"}
+                            </button>
+                          </td>
                           <td className="sticky-col"><b>{s.symbol}</b><div className="faint" style={{ fontSize: 12, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis" }}>{s.company}</div></td>
                           <td>{s.industry}</td>
                           <td className={multi(s) ? "multi" : ""}>{s.indices.join(", ")}</td>
@@ -318,6 +328,27 @@ function Drill({ args, ask, pending, picks, togglePick, setPicks, rsSet, setRsSe
                           <td className="num">{pct(s.emaGap)}</td>
                           <td className="num">{num(s.price, 2)}</td>
                         </tr>
+                        {openRow === s.symbol && (
+                          <tr className="detail-row">
+                            <td colSpan={9 + r.labels.length}>
+                              <div className="rs-detail">
+                                <div className="rs-detail-head">
+                                  <b>{s.symbol}</b> <span className="muted">relative strength against Nifty 50, month-end closes</span>
+                                  <Seg label="Months shown in the chart" value={chartMonths} onChange={setChartMonths}
+                                    options={[[6, "6 months"], [12, "12 months"], [24, "24 months"]]} />
+                                </div>
+                                {s.trail?.rs?.length > 1 ? <RSChart trail={s.trail} months={chartMonths} /> : <p className="muted">Not enough monthly history for a chart.</p>}
+                                <p className="section-note" style={{ marginTop: 6 }}>
+                                  RS = the stock's month-end close divided by Nifty 50's, rescaled so the first month shown is 100.
+                                  The dashed steps are its highest RS of the 12 months up to each month; a dot is a new 12-month high (the
+                                  dark 100 cells in the table). {r.provisional ? `${r.labels[r.labels.length - 1]} is still running.` : ""}{" "}
+                                  <a href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(`NSE:${s.symbol}`)}`} target="_blank" rel="noopener noreferrer">Open the price chart on TradingView</a>
+                                </p>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                        </Fragment>
                       ))}
                     </tbody>
                   </table>

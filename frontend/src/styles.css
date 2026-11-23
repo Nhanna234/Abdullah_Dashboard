@@ -246,3 +246,14 @@ details.more .body { padding: 12px 0 4px 28px; max-width: 92ch; }
 }
 .select { max-width: 100%; }
 .field { min-width: 0; max-width: 100%; }
+
+/* expandable RS chart under a stock row */
+.expander { border: 1px solid var(--line); background: var(--surface); border-radius: 4px; width: 24px; height: 24px; cursor: pointer; color: var(--ink-2); line-height: 1; padding: 0; }
+.expander:hover, .expander[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+table.data tbody tr.is-open td { background: #f4f6fb; }
+table.data tbody tr.detail-row td { background: #fbfcfb; white-space: normal; padding: 14px 18px 16px; }
+table.data tbody tr.detail-row:hover td { background: #fbfcfb; }
+.rs-detail { max-width: 860px; }
+.rs-detail-head { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; margin-bottom: 10px; }
+.rs-detail-head .seg { margin-left: auto; }
+.rs-detail a { color: var(--accent); font-weight: 600; }
